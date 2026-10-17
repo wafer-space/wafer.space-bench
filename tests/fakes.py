@@ -12,7 +12,10 @@ Models what the tooling relies on:
   `rulesets`). Active rulesets are enforced on API ref writes: a matching ref may not be
   created (`creation`), moved (`update`, `non_fast_forward`) or deleted (`deletion`);
   each refused write is appended to `refused`. `pull_requests_supported = False` models
-  an API that does not report (or accept) `has_pull_requests`.
+  an API that does not report (or accept) `has_pull_requests`; `pull_requests_rejected`
+  one that reports it but refuses to set it (HTTP 422), `pull_requests_ignored` one that
+  accepts the PATCH but keeps the old value. `actions_org_managed` makes setting Actions
+  fail with HTTP 409, as when the org policy decides.
 
 Inspection state is keyed by each repo's current full name.
 """
@@ -48,6 +51,9 @@ class FakeGitHub:
         self.rulesets: dict[str, dict[str, dict]] = {}  # repo -> ruleset name -> ruleset
         self.refused: list[tuple[str, str, str]] = []  # (repo, ref, operation)
         self.pull_requests_supported = True
+        self.pull_requests_rejected = False
+        self.pull_requests_ignored = False
+        self.actions_org_managed = False
 
     # --- test setup ---------------------------------------------------------
 
@@ -271,8 +277,11 @@ class FakeGitHub:
         self._record("update_repo", full_name, dict(fields))
         name = self._resolve(full_name)
         unknown = set(fields) - set(self.settings[name])
-        if unknown or ("has_pull_requests" in fields and not self.pull_requests_supported):
+        prs = "has_pull_requests" in fields
+        if unknown or (prs and (not self.pull_requests_supported or self.pull_requests_rejected)):
             raise GitHubError(f"repos/{name}: Validation Failed: {sorted(fields)} (HTTP 422)")
+        if prs and self.pull_requests_ignored:
+            fields = {k: v for k, v in fields.items() if k != "has_pull_requests"}
         self.settings[name].update(fields)
 
     def get_topics(self, full_name: str) -> list[str]:
@@ -290,7 +299,10 @@ class FakeGitHub:
 
     def set_actions_enabled(self, full_name: str, enabled: bool) -> None:
         self._record("set_actions_enabled", full_name, enabled)
-        self.actions_enabled[self._resolve(full_name)] = enabled
+        name = self._resolve(full_name)
+        if self.actions_org_managed:
+            raise GitHubError(f"repos/{name}/actions/permissions: Conflict (HTTP 409)")
+        self.actions_enabled[name] = enabled
 
     def get_vulnerability_alerts(self, full_name: str) -> bool:
         return self.vulnerability_alerts[self._resolve(full_name)]

@@ -9,10 +9,11 @@ from test_privacy import BANNED
 from wafer_space_bench.catalog import Tapeout
 from wafer_space_bench.cli import main
 from wafer_space_bench.config import LocalConfig, load_config, resolve_clone_url
-from wafer_space_bench.copy import RestoreSource, copy_description, restore_sources, run_copies, run_copy
+from wafer_space_bench.copy import RestoreSource, restore_sources, run_copies, run_copy
 from wafer_space_bench.git import Git
 from wafer_space_bench.naming import RepoRef
 from wafer_space_bench.scan import RepoPlan, write_plans
+from wafer_space_bench.settings import bench_description, desired_settings
 
 ORG = "wafer-space-bench"
 TAG = "tinytapeout/ttgf0p2/tt_um_x"
@@ -79,7 +80,8 @@ def test_copy_pushes_branches_and_tags(tmp_path, upstream, remote):
     assert Git(tmp_path / "remote.git").rev_parse(f"refs/tags/{TAG}") == shas["ttgf0p2"]
     assert f"{ORG}/a--upstream" in gh.repos
     (desc,) = [c[1][2] for c in gh.calls if c[0] == "create_repo"]
-    assert desc == copy_description(copy_plan())
+    assert desc == bench_description(copy_plan(), tos["a/upstream"])
+    assert desc.startswith("Benchmark copy of https://github.com/a/upstream: 3 tapeouts on ")
     missing = [f["tag"] for e, f in ev if e == "missing-commit"]
     assert missing == ["tinytapeout/ttgf0p2/gone", "tinytapeout/ttgf0p2/e"]
     (ce,) = [f for e, f in ev if e == "copy"]
@@ -195,16 +197,14 @@ def test_resolve_clone_url_falls_back_to_public(tmp_path):
     assert resolve_clone_url("https://github.com/o/r", LocalConfig(tmp_path, {})) == "https://github.com/o/r"
 
 
-def test_copy_description_public():
-    cases = [
-        (copy_plan(), "shares the fork network of x/root"),
-        (copy_plan(host="gitlab.com"), "hosted on GitLab"),
-        (copy_plan(strategy="restore"), "upstream repository was deleted"),
-    ]
-    for p, why in cases:
-        d = copy_description(p)
-        assert d == f"Copy of {p.source.url} for the wafer.space GF180 benchmark ({why})"
-        assert not [b for b in BANNED if b in d]
+def test_copy_description_is_the_settings_description():
+    """`copy` creates each repo with the description `settings` keeps, so it never churns."""
+    for p in (copy_plan(), copy_plan(host="gitlab.com"), copy_plan(strategy="restore")):
+        tos = {p.source.key: [tapeout("a" * 40)]}
+        d = bench_description(p, tos[p.source.key])
+        assert d == desired_settings(p, tos).repo["description"]
+        assert d.startswith("Benchmark copy of ") and not [b for b in BANNED if b in d]
+    assert bench_description(copy_plan(strategy="restore"), []).endswith(" (upstream deleted)")
 
 
 def test_copy_none_reports_no_source(tmp_path, remote):

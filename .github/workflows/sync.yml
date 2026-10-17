@@ -76,10 +76,11 @@ jobs:
             args+=(--dry-run)
           fi
           uv run wsbench --remote-fmt 'https://github.com/{full}.git' --log work/events.jsonl sync "${args[@]}"
-      # Runs even when sync failed for some repo: settings do not depend on the branches,
-      # and a repo created since the last run gets its settings (and frozen rulesets) today.
+      # Runs even when sync failed for some repo (settings do not depend on the branches,
+      # and a repo created since the last run gets its settings and frozen rulesets today),
+      # but not after a cancel or without a token.
       - name: Settings
-        if: always()
+        if: ${{ !cancelled() && steps.app-token.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           ONLY: ${{ inputs.only }}

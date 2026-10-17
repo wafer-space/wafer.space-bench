@@ -23,6 +23,7 @@ from wafer_space_bench.git import Git, GitError
 from wafer_space_bench.github import GhCli, GitHub, GitHubError, NotFound
 from wafer_space_bench.naming import COMMIT_SOURCE
 from wafer_space_bench.scan import RepoPlan, read_plans
+from wafer_space_bench.settings import bench_description
 
 STRATEGIES = ("copy", "restore")
 
@@ -68,10 +69,6 @@ def copy_why(plan: RepoPlan) -> str:
     if plan.source.host != "github.com":
         return "hosted on GitLab"
     return f"shares the fork network of {plan.network}"
-
-
-def copy_description(plan: RepoPlan) -> str:
-    return f"Copy of {plan.source.url} for the wafer.space GF180 benchmark ({copy_why(plan)})"
 
 
 def _public_url(plan: RepoPlan, sources: dict[str, RestoreSource]) -> str:
@@ -174,7 +171,8 @@ def run_copy(
         created = False
         if not exists:
             name = plan.target.split("/", 1)[1]
-            description = copy_description(plan)
+            # The same description `wsbench settings` keeps, so it never churns.
+            description = bench_description(plan, tapeouts.get(plan.source.key, []))
             retry_rate_limited(
                 lambda: gh.create_repo(org, name, description), sleep=sleep, log=log, target=plan.target
             )

@@ -159,10 +159,12 @@ def test_apply_settings_only_changes_diffs():
     gh.settings[p.target]["has_issues"] = False  # already right: not sent
     tos = {"a/up": [tapeout()]}
     status = apply_settings(p, tos, gh, ORG, dry_run=False, **quiet())
-    assert status.startswith("ok: ")
-    (patch,) = [c for c in gh.calls if c[0] == "update_repo"]
-    assert "has_issues" not in patch[1][1]
-    assert patch[1][1]["has_wiki"] is False and patch[1][1]["has_pull_requests"] is False
+    assert status.startswith("ok: ") and "has_pull_requests" in status
+    patch, prs = [c[1][1] for c in gh.calls if c[0] == "update_repo"]
+    assert "has_issues" not in patch and "has_pull_requests" not in patch
+    assert patch["has_wiki"] is False
+    assert prs == {"has_pull_requests": False}  # on its own, after the other fields
+    assert gh.settings[p.target]["has_pull_requests"] is False
     assert gh.topics[p.target] == desired_settings(p, tos).topics
     assert gh.actions_enabled[p.target] is False and gh.vulnerability_alerts[p.target] is False
     assert set(gh.rulesets[p.target]) == {"bench-frozen-branches", "bench-frozen-tags"}
@@ -213,6 +215,90 @@ def test_pull_requests_left_alone_when_unsupported():
     )
     assert all("has_pull_requests" not in c[1][1] for c in gh.calls if c[0] == "update_repo")
     assert [e for e, _ in log].count("pull-requests-unsupported") == 1
+
+
+def _pr_run(gh, n=2):
+    plans = [plan(f"o/r{i}") for i in range(n)]
+    for p in plans:
+        org_repo(gh, p)
+    log = Events()
+    failed = run_settings(
+        plans, {}, gh, ORG, only=None, shard=None, dry_run=False, delay=0, sleep=lambda s: None, log=log
+    )
+    statuses = [f["status"] for e, f in log if e == "settings"]
+    return failed, statuses, [e for e, _ in log], plans
+
+
+def test_pull_requests_rejected_does_not_cancel_other_fields():
+    gh = FakeGitHub()
+    gh.pull_requests_rejected = True
+    failed, statuses, events, plans = _pr_run(gh)
+    assert failed == 0
+    assert all(s.startswith("ok: ") and "has_pull_requests" not in s for s in statuses)
+    assert all(gh.settings[p.target]["has_wiki"] is False for p in plans)  # the main PATCH went through
+    assert events.count("pull-requests-update-failed") == 1  # tried once per run, not per repo
+    prs_patches = [c for c in gh.calls if c[0] == "update_repo" and "has_pull_requests" in c[1][1]]
+    assert len(prs_patches) == 1
+
+
+def test_pull_requests_ignored_stops_trying_for_the_run():
+    gh = FakeGitHub()
+    gh.pull_requests_ignored = True
+    failed, statuses, events, plans = _pr_run(gh, n=3)
+    assert failed == 0 and events.count("pull-requests-ignored") == 1
+    prs_patches = [c for c in gh.calls if c[0] == "update_repo" and "has_pull_requests" in c[1][1]]
+    assert len(prs_patches) == 1
+    # A later run in which everything else is set tries once, then is unchanged (no churn).
+    n = len(gh.calls)
+    failed, statuses, events, _ = _pr_run_again(gh, plans)
+    assert statuses == ["unchanged", "unchanged", "unchanged"]
+    assert len(writes(gh, n)) == 1 and events.count("pull-requests-ignored") == 1
+
+
+def _pr_run_again(gh, plans):
+    log = Events()
+    failed = run_settings(
+        plans, {}, gh, ORG, only=None, shard=None, dry_run=False, delay=0, sleep=lambda s: None, log=log
+    )
+    return failed, [f["status"] for e, f in log if e == "settings"], [e for e, _ in log], plans
+
+
+def test_pull_requests_success_is_reported():
+    gh = FakeGitHub()
+    failed, statuses, events, plans = _pr_run(gh)
+    assert failed == 0 and all("has_pull_requests" in s for s in statuses)
+    assert "pull-requests-ignored" not in events and "pull-requests-update-failed" not in events
+    n = len(gh.calls)
+    assert _pr_run_again(gh, plans)[1] == ["unchanged", "unchanged"] and writes(gh, n) == []
+
+
+def test_actions_managed_by_org_is_not_an_error():
+    gh = FakeGitHub()
+    gh.actions_org_managed = True
+    failed, statuses, events, plans = _pr_run(gh, n=3)
+    assert failed == 0
+    assert all(s.startswith("ok: ") and "actions_enabled" not in s for s in statuses)
+    assert events.count("actions-managed-by-org") == 1
+    assert len([c for c in gh.calls if c[0] == "set_actions_enabled"]) == 1  # not retried per repo
+    assert all(gh.topics[p.target] for p in plans)  # the rest was still applied
+
+
+def test_actions_other_error_is_an_error():
+    gh, p = FakeGitHub(), plan()
+    org_repo(gh, p)
+
+    def boom(full, enabled):
+        raise GitHubError("repos/x/actions/permissions: Forbidden (HTTP 403)")
+
+    gh.set_actions_enabled = boom
+    assert apply_settings(p, {}, gh, ORG, dry_run=False, **quiet()).startswith("error: ")
+
+
+def test_copy_creates_repos_with_the_settings_description():
+    from wafer_space_bench.settings import bench_description
+
+    p, tos = plan("g/lab", strategy="copy", host="gitlab.com"), {"g/lab": [tapeout("g/lab")]}
+    assert desired_settings(p, tos).repo["description"] == bench_description(p, tos["g/lab"])
 
 
 def test_apply_settings_writes_are_retried_when_rate_limited():
@@ -374,7 +460,8 @@ def test_sync_workflow_runs_settings():
     i, j = names.index("Sync"), names.index("Settings")
     assert j == i + 1
     step = steps[j]
-    assert step["if"] == "always()"
+    assert step["if"] == "${{ !cancelled() && steps.app-token.outcome == 'success' }}"
+    assert "app-token" in [s.get("id") for s in steps[:i]]
     assert set(step["env"]) == {"GH_TOKEN", "ONLY", "DRY_RUN", "SHARD"}
     assert "${{" not in step["run"]
     assert 'settings "${args[@]}"' in step["run"] and '--shard "$SHARD/8"' in step["run"]

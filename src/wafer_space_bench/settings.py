@@ -23,7 +23,8 @@ from wafer_space_bench.events import EventLog
 from wafer_space_bench.fork import Log, plan_matches, retry_rate_limited, select_only
 from wafer_space_bench.github import GhCli, GitHub, GitHubError, NotFound
 from wafer_space_bench.scan import RepoPlan, read_plans
-from wafer_space_bench.sync import _check_shard, parse_shard, shard_of
+
+# sync is imported where it is used: sync imports copy, which imports bench_description.
 
 STRATEGIES = ("fork", "copy", "restore")
 INDEX_URL = "https://wafer-space-bench.github.io"
@@ -77,7 +78,8 @@ def _upstream_url(plan: RepoPlan) -> str:
     return plan.source.url
 
 
-def _description(plan: RepoPlan, tos: list[Tapeout]) -> str:
+def bench_description(plan: RepoPlan, tos: list[Tapeout]) -> str:
+    """The repo description: `copy` creates repos with it and `settings` keeps it."""
     runs = sorted({f"{t.org}/{t.run}" for t in tos})
     head = f"Benchmark copy of {_upstream_url(plan)}"
     tail = " (upstream deleted)" if plan.strategy == "restore" else ""
@@ -107,7 +109,7 @@ def desired_settings(
             topics.append(t)
     return DesiredSettings(
         repo={
-            "description": _description(plan, tos),
+            "description": bench_description(plan, tos),
             "homepage": f"{index_url}/#{name}",
             "has_issues": False,
             "has_projects": False,
@@ -177,6 +179,47 @@ def diff_settings(current: DesiredSettings, desired: DesiredSettings) -> dict[st
     return out
 
 
+@dataclass
+class RunState:
+    """What one run learned that holds for every repo, so it is not retried per repo."""
+
+    skip_pull_requests: bool = False  # has_pull_requests was rejected or ignored
+    skip_actions: bool = False  # Actions are managed by the org policy (HTTP 409)
+
+
+def _set_pull_requests(
+    gh: GitHub, target: str, want: bool, state: RunState, write: Callable, log: Log
+) -> bool:
+    """PATCH has_pull_requests on its own, after the other fields, so a rejection cannot
+    cancel them. Rejected or ignored (a re-read still differs): logged, and not tried again
+    in this run. True if it is now set."""
+    try:
+        write(lambda: gh.update_repo(target, {"has_pull_requests": want}), setting="has_pull_requests")
+    except GitHubError as e:
+        log("pull-requests-update-failed", target=target, error=str(e)[:300])
+        state.skip_pull_requests = True
+        return False
+    if gh.get_repo_settings(target).get("has_pull_requests") != want:
+        log("pull-requests-ignored", target=target)
+        state.skip_pull_requests = True
+        return False
+    return True
+
+
+def _set_actions(gh: GitHub, target: str, want: bool, state: RunState, write: Callable, log: Log) -> bool:
+    """Set Actions on or off. HTTP 409 means the org policy decides (for example "selected
+    repositories"): logged once, not an error, and not tried again in this run."""
+    try:
+        write(lambda: gh.set_actions_enabled(target, want), setting="actions")
+    except GitHubError as e:
+        if "HTTP 409" not in str(e):
+            raise
+        log("actions-managed-by-org", target=target)
+        state.skip_actions = True
+        return False
+    return True
+
+
 def _apply(
     plan: RepoPlan,
     tapeouts: dict[str, list[Tapeout]],
@@ -185,6 +228,7 @@ def _apply(
     dry_run: bool,
     sleep: Callable[[float], None],
     log: Log,
+    state: RunState,
 ) -> str:
     target = plan.target
     try:
@@ -195,23 +239,31 @@ def _apply(
         log("pull-requests-unsupported", target=target)
     want = desired_settings(plan, tapeouts)
     diff = diff_settings(current, want)
+    if state.skip_pull_requests:
+        diff.pop("has_pull_requests", None)
+    if state.skip_actions:
+        diff.pop("actions_enabled", None)
     if not diff:
         return "unchanged"
-    fields = ", ".join(diff)
     if dry_run:
         log("settings-plan", target=target, fields=list(diff))
-        return f"dry-run: {fields}"
+        return f"dry-run: {', '.join(diff)}"
 
     def write(fn: Callable[[], object], **context) -> None:
         retry_rate_limited(fn, sleep=sleep, log=log, target=target, **context)
 
-    repo_fields = {k: want.repo[k] for k in diff if k in want.repo}
+    done = [k for k in diff if k != "has_pull_requests" and k != "actions_enabled"]
+    repo_fields = {k: want.repo[k] for k in diff if k in want.repo and k != "has_pull_requests"}
     if repo_fields:
         write(lambda: gh.update_repo(target, repo_fields), setting="repo")
+    if "has_pull_requests" in diff and _set_pull_requests(
+        gh, target, want.repo["has_pull_requests"], state, write, log
+    ):
+        done.append("has_pull_requests")
     if "topics" in diff:
         write(lambda: gh.set_topics(target, want.topics), setting="topics")
-    if "actions_enabled" in diff:
-        write(lambda: gh.set_actions_enabled(target, want.actions_enabled), setting="actions")
+    if "actions_enabled" in diff and _set_actions(gh, target, want.actions_enabled, state, write, log):
+        done.append("actions_enabled")
     if "vulnerability_alerts" in diff:
         write(
             lambda: gh.set_vulnerability_alerts(target, want.vulnerability_alerts),
@@ -220,7 +272,8 @@ def _apply(
     for name, rs in want.ruleset.items():
         if f"ruleset:{name}" in diff:
             write(lambda rs=rs: gh.put_ruleset(target, rs), setting=name)
-    return f"ok: {fields}"
+    done = [k for k in diff if k in done]  # in diff order
+    return f"ok: {', '.join(done)}" if done else "unchanged"
 
 
 def apply_settings(
@@ -232,14 +285,17 @@ def apply_settings(
     dry_run: bool = False,
     sleep: Callable[[float], None] = time.sleep,
     log: Log,
+    state: RunState | None = None,
 ) -> str:
     """Bring bench repo `plan.target` (in `org`) to `desired_settings`, writing only what
     differs. Returns "pending" (not in the org yet), "unchanged", "dry-run: <fields>",
-    "ok: <fields>" or "error: ..."."""
+    "ok: <fields>" or "error: ...". `state` is shared by the repos of one run (a fresh
+    one if not given); a has_pull_requests or Actions write that cannot take effect is
+    tried once per run, not per repo, and is not an error."""
     if plan.target.split("/", 1)[0].lower() != org.lower():
         raise ValueError(f"{plan.target} is not in {org}")
     try:
-        return _apply(plan, tapeouts, gh, dry_run=dry_run, sleep=sleep, log=log)
+        return _apply(plan, tapeouts, gh, dry_run=dry_run, sleep=sleep, log=log, state=state or RunState())
     except GitHubError as e:
         return f"error: {e}"
 
@@ -266,6 +322,8 @@ def run_settings(
         names = {o.lower() for o in only}
         todo = [p for p in todo if plan_matches(p, names)]
     if shard is not None:
+        from wafer_space_bench.sync import _check_shard, shard_of
+
         k, n = _check_shard(*shard)
         todo = [p for p in todo if shard_of(p.target, n) == k]
     outside = [p.target for p in todo if p.target.split("/", 1)[0].lower() != org.lower()]
@@ -273,6 +331,7 @@ def run_settings(
         raise ValueError(f"not in {org}: {', '.join(outside)}")
 
     once: set[str] = set()
+    state = RunState()
 
     def run_log(event: str, **fields) -> None:
         if event == "pull-requests-unsupported":  # the API's answer is the same for every repo
@@ -284,7 +343,9 @@ def run_settings(
     failed = 0
     for i, p in enumerate(todo, 1):
         try:
-            status = apply_settings(p, tapeouts, gh, org, dry_run=dry_run, sleep=sleep, log=run_log)
+            status = apply_settings(
+                p, tapeouts, gh, org, dry_run=dry_run, sleep=sleep, log=run_log, state=state
+            )
         except Exception as e:  # noqa: BLE001 -- a bug hit by one repo must not stop the others
             status = f"error: {type(e).__name__}: {e}"
         log("settings", n=f"{i}/{len(todo)}", target=p.target, status=status)
@@ -315,6 +376,8 @@ def _settings_cmd(args) -> int:
 
 
 def add_subcommand(subparsers) -> None:
+    from wafer_space_bench.sync import parse_shard
+
     p = subparsers.add_parser(
         "settings", help="set repo settings: features off, description, topics, frozen rulesets"
     )
