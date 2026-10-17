@@ -45,15 +45,29 @@ def plan_layout(heads: list[str], tags: list[str]) -> LayoutPlan:
     """The layout for a repo with these branch and tag names.
 
     Conflicts: an existing `about` or `dev/*` branch, and any name `x` alongside `x/...`
-    among the existing and the new branch names (git cannot hold both)."""
+    among the existing and the new branch names (git cannot hold both). A clash is
+    reported by the existing heads in it, or else by the branches the new names come from."""
     originals = sorted(h for h in heads if classify_branch(h) == "original")
     upstream = {b: f"upstream/{b}" for b in originals}
     tapeout = sorted(t for t in tags if is_tapeout_tag(t))
     conflicts = {h for h in heads if classify_branch(h) in ("about", "dev")}
-    names = set(heads) | set(upstream.values()) | {f"tapeout/{t}" for t in tapeout} | {"about"}
-    original = {new: b for b, new in upstream.items()}  # report upstream/x as x
-    conflicts |= {original.get(x, x) for x in names if any(y.startswith(x + "/") for y in names)}
+    source = {new: b for b, new in upstream.items()} | {f"tapeout/{t}": f"tapeout/{t}" for t in tapeout}
+    names = set(heads) | set(source) | {"about"}
+    for x in names:
+        for y in names:
+            if y.startswith(x + "/"):
+                existing = {x, y} & set(heads)
+                conflicts |= existing or {source[n] for n in (x, y) if n in source}
     return LayoutPlan(upstream, tapeout, originals, sorted(conflicts))
+
+
+def _clashes(name: str, names: set[str]) -> bool:
+    """True if `name` and some other name in `names` are `x` and `x/...` (git cannot hold both)."""
+    return any(n != name and (n.startswith(name + "/") or name.startswith(n + "/")) for n in names)
+
+
+def _heads(refs: dict[str, str]) -> dict[str, str]:
+    return {r.removeprefix("refs/heads/"): s for r, s in refs.items() if r.startswith("refs/heads/")}
 
 
 def _work_repo(cfg: LocalConfig, target: str) -> Git:
@@ -105,7 +119,7 @@ def _layout(
         return "pending", False
     remote = remote_fmt.format(full=target)
     refs = Git.ls_remote(remote)
-    heads = {r.removeprefix("refs/heads/"): s for r, s in refs.items() if r.startswith("refs/heads/")}
+    heads = _heads(refs)
     tags = {r.removeprefix("refs/tags/"): s for r, s in refs.items() if r.startswith("refs/tags/")}
     lp = plan_layout(list(heads), list(tags))
 
@@ -115,9 +129,20 @@ def _layout(
         conflicts = _sha_conflicts(lp, heads, tags, git.show(ABOUT_REF, "bench.yaml") is not None)
         if conflicts:
             return "conflict: " + ", ".join(conflicts), False
+        if not any(classify_branch(h) in ("original", "upstream") for h in heads):
+            return "empty", False  # nothing pushed yet: laying out would hide it from copy
 
+    mismatches = 0
+    upstream = dict(lp.upstream)
+    if laid_out:  # conflicts were not checked: skip new originals that cannot be copied
+        names = set(heads) | set(upstream.values()) | {f"tapeout/{t}" for t in lp.tapeout}
+        for b, new in lp.upstream.items():
+            if _clashes(new, names) or _clashes(b, names):
+                log("branch-conflict", target=target, branch=b, new=new)
+                del upstream[b]
+                mismatches += 1
     branches = {h for h in heads if classify_branch(h) in ("upstream", "tapeout", "dev")}
-    branches |= {"about", *lp.upstream.values(), *(f"tapeout/{t}" for t in lp.tapeout)}
+    branches |= {"about", *upstream.values(), *(f"tapeout/{t}" for t in lp.tapeout)}
     counts = (
         f"{sum(classify_branch(b) == 'upstream' for b in branches)} upstream, "
         f"{sum(classify_branch(b) == 'tapeout' for b in branches)} tapeout"
@@ -138,11 +163,12 @@ def _layout(
         git.push(remote, [f"{sha}:{ABOUT_REF}"])
         changed = True
     moves = []
-    for b, new in lp.upstream.items():
+    for b, new in upstream.items():
         if new not in heads:
             write(lambda new=new, b=b: gh.set_ref(target, f"heads/{new}", heads[b]), ref=new)
         elif heads[new] != heads[b]:  # only possible once laid out (else a conflict): leave both
             log("upstream-mismatch", target=target, branch=b, branch_sha=heads[b], upstream_sha=heads[new])
+            mismatches += 1
             continue
         moves.append(b)
     for t in lp.tapeout:
@@ -153,11 +179,18 @@ def _layout(
             )
         elif heads[branch] != commit:  # tapeout branches are frozen: never moved
             log("tapeout-mismatch", target=target, branch=branch, branch_sha=heads[branch], tag_sha=commit)
+            mismatches += 1
     if not laid_out:
         write(lambda: gh.set_default_branch(target, "about"), ref="about")
-    for b in moves:  # only after the default branch is `about`
-        write(lambda b=b: gh.delete_ref(target, f"heads/{b}"), ref=b)
-    return f"ok: {counts}", changed
+    # Only after the default branch is `about`, and only originals that have not moved since
+    # the listing and whose copy is verified on the remote; a re-run handles the rest.
+    now_heads = _heads(Git.ls_remote(remote)) if moves else {}
+    for b in moves:
+        if now_heads.get(b) == heads[b] == now_heads.get(upstream[b]):
+            write(lambda b=b: gh.delete_ref(target, f"heads/{b}"), ref=b)
+        else:
+            log("delete-skipped", target=target, branch=b)
+    return f"ok: {counts}" + (f", {mismatches} mismatch" if mismatches else ""), changed
 
 
 def _apply(
@@ -205,8 +238,9 @@ def apply_layout(
 ) -> str:
     """Lay out bench repo `plan.target` (in `org`); `tapeouts` is keyed by RepoRef.key and
     `now` is the ISO time for bench.yaml. Logs one `layout` event and returns its status:
-    "pending" (not in the org yet), "conflict: <names>", "ok: N upstream, M tapeout" (the
-    counts of those branches in the final layout), "dry-run: ..." or "error: ...".
+    "pending" (not in the org yet), "empty" (no branches to lay out yet), "conflict: <names>",
+    "ok: N upstream, M tapeout[, K mismatch]" (the counts of those branches in the final
+    layout; K counts branches logged and left for a human), "dry-run: ..." or "error: ...".
     Idempotent: a laid-out repo with nothing new gets no writes."""
     if plan.target.split("/", 1)[0].lower() != org.lower():
         raise ValueError(f"{plan.target} is not in {org}")
@@ -230,17 +264,18 @@ def run_layouts(
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """Lay out every fork/copy/restore plan, sleeping `delay` after each repo that changed.
-    Returns the number of repos that ended in an error or a conflict."""
+    Returns the number of repos that ended in an error, a conflict or "empty"."""
     todo = [p for p in plans if p.strategy in STRATEGIES]
+    outside = [p.target for p in todo if p.target.split("/", 1)[0].lower() != org.lower()]
+    if outside:  # checked before any repo is touched
+        raise ValueError(f"not in {org}: {', '.join(outside)}")
     failed = 0
     for i, p in enumerate(todo, 1):
-        if p.target.split("/", 1)[0].lower() != org.lower():
-            raise ValueError(f"{p.target} is not in {org}")
         status, changed = _apply(
             p, tapeouts, gh, cfg, remote_fmt=remote_fmt, now=now(), log=log, sleep=sleep, dry_run=dry_run
         )
         print(f"{i}/{len(todo)} {p.target}: {status}", flush=True)
-        failed += status.startswith(("error:", "conflict:"))
+        failed += status == "empty" or status.startswith(("error:", "conflict:"))
         if changed and i < len(todo):
             sleep(delay)
     return failed

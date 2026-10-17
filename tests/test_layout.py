@@ -16,9 +16,10 @@ from fakes import FakeGitHub
 from wafer_space_bench.catalog import Tapeout
 from wafer_space_bench.cli import main
 from wafer_space_bench.config import LocalConfig
+from wafer_space_bench.copy import run_copy
 from wafer_space_bench.git import Git
 from wafer_space_bench.github import GitHubError, RateLimited
-from wafer_space_bench.layout import LayoutPlan, apply_layout, plan_layout
+from wafer_space_bench.layout import LayoutPlan, apply_layout, plan_layout, run_layouts
 from wafer_space_bench.naming import RepoRef
 from wafer_space_bench.scan import RepoPlan, write_plans
 
@@ -177,7 +178,8 @@ def test_plan_layout_tapeout_from_tags():
 
 def test_layout_conflicts():
     assert plan_layout(["about", "main"], []).conflicts == ["about"]
-    assert plan_layout(["x", "x/y"], []).conflicts == ["x"]
+    assert plan_layout(["x", "x/y"], []).conflicts == ["x", "x/y"]
+    assert plan_layout(["about/x", "main"], []).conflicts == ["about/x"]  # the head, not "about"
     assert plan_layout(["dev/z", "main"], []).conflicts == ["dev/z"]
     # an original `upstream` (or `tapeout`) branch collides with the namespace it would need
     assert plan_layout(["upstream", "main"], []).conflicts == ["upstream"]
@@ -232,7 +234,7 @@ def test_apply_layout_idempotent(tmp_path, upstream, remote):
     n = len(gh.calls)
     second = run(gh, tmp_path, remote, shas, now=LATER)
     assert second == first
-    assert writes(gh)[n:] == [] and gh.calls[n:] == []
+    assert writes(gh)[n:] == []  # no writes (the fake records only writes; reads are not checked)
     assert remote_heads(tmp_path) == before  # no new about commit for a timestamp-only change
 
 
@@ -341,7 +343,7 @@ def test_apply_layout_never_moves_tapeout_branch(tmp_path, upstream, remote):
     run(gh, tmp_path, remote, shas)
     Git(tmp_path / "remote.git").update_ref(f"refs/heads/tapeout/{TAG}", shas["main"])
     ev = Events()
-    assert run(gh, tmp_path, remote, shas, ev=ev) == "ok: 3 upstream, 1 tapeout"
+    assert run(gh, tmp_path, remote, shas, ev=ev) == "ok: 3 upstream, 1 tapeout, 1 mismatch"
     assert remote_heads(tmp_path)[f"tapeout/{TAG}"] == shas["main"]
     assert ("tapeout-mismatch", {"target": TARGET, "branch": f"tapeout/{TAG}",
                                  "branch_sha": shas["main"], "tag_sha": shas["ttgf0p2"]}) in ev  # fmt: skip
@@ -363,7 +365,7 @@ def test_apply_layout_keeps_differing_original_after_layout(tmp_path, upstream, 
     run(gh, tmp_path, remote, shas)
     Git(tmp_path / "remote.git").update_ref("refs/heads/main", shas["feature/x"])
     ev = Events()
-    assert run(gh, tmp_path, remote, shas, ev=ev) == "ok: 3 upstream, 1 tapeout"
+    assert run(gh, tmp_path, remote, shas, ev=ev) == "ok: 3 upstream, 1 tapeout, 1 mismatch"
     heads = remote_heads(tmp_path)
     assert heads["main"] == shas["feature/x"]
     assert heads["upstream/main"] == shas["main"]
@@ -434,3 +436,109 @@ def test_cli_layout_exit_code_on_conflict(tmp_path, upstream, remote, monkeypatc
             "--config", str(tmp_path / "none.toml"), "--remote-fmt", remote]  # fmt: skip
     monkeypatch.chdir(tmp_path)
     assert main([*base, "layout"]) == 1
+
+
+# --- review fixes --------------------------------------------------------------
+
+
+def test_apply_layout_empty_repo_is_not_laid_out(tmp_path, upstream, remote):
+    """A bench repo with no branches yet (copy push failed, fork not ready) is left alone, so
+    a later copy still pushes its heads; then the layout runs normally."""
+    _, shas = upstream
+    gh = SyncedFake(tmp_path / "remote.git")
+    gh.add_upstream(TARGET, branches={})
+    ev = Events()
+    assert run(gh, tmp_path, remote, shas, ev=ev) == "empty"
+    assert writes(gh) == [] and remote_heads(tmp_path) == {}
+    assert run_layouts([plan()], tapeouts(shas["ttgf0p2"]), gh, cfg(tmp_path), ORG, remote_fmt=remote,
+                       log=Events(), now=lambda: NOW, sleep=Sleeps()) == 1  # fmt: skip
+    copy = RepoPlan(RepoRef("github.com", "a", "upstream"), "a/upstream", "live", "x/root", "main", 1, "copy",
+                    TARGET)  # fmt: skip
+    mirror_cfg = LocalConfig(work_dir=tmp_path / "work", mirrors={"https://github.com/a/": tmp_path})
+    assert run_copy(copy, tapeouts(shas["ttgf0p2"]), gh, mirror_cfg, ORG, remote, log=Events()) == "pushed"
+    assert run(gh, tmp_path, remote, shas) == "ok: 3 upstream, 1 tapeout"
+    assert set(remote_heads(tmp_path)) == {
+        "about", "upstream/main", "upstream/feature/x", "upstream/ttgf0p2", f"tapeout/{TAG}"
+    }  # fmt: skip
+
+
+class MoveAfterDefault(SyncedFake):
+    """Moves `main` on the remote right after the default branch switch (a concurrent push)."""
+
+    def __init__(self, remote_path, sha):
+        super().__init__(remote_path)
+        self._sha = sha
+
+    def set_default_branch(self, full_name, branch):
+        super().set_default_branch(full_name, branch)
+        self.remote.update_ref("refs/heads/main", self._sha)
+
+
+def test_apply_layout_skips_delete_of_branch_moved_since_listing(tmp_path, upstream, remote):
+    path, shas = upstream
+    sh(path, "push", "-q", remote, "refs/heads/*:refs/heads/*")
+    gh = MoveAfterDefault(tmp_path / "remote.git", shas["feature/x"])
+    gh.add_upstream(TARGET, branches=shas)
+    ev = Events()
+    assert run(gh, tmp_path, remote, shas, ev=ev) == "ok: 3 upstream, 0 tapeout"
+    heads = remote_heads(tmp_path)
+    assert heads["main"] == shas["feature/x"]  # kept: its new commit is not under upstream/main
+    assert heads["upstream/main"] == shas["main"]
+    assert "feature/x" not in heads and "ttgf0p2" not in heads
+    assert ("delete-skipped", {"target": TARGET, "branch": "main"}) in ev
+
+
+class LosesSetRef(SyncedFake):
+    """Accepts set_ref for `ref` but the branch never appears on the remote."""
+
+    def __init__(self, remote_path, ref):
+        super().__init__(remote_path)
+        self._lost = ref
+
+    def set_ref(self, full_name, ref, sha):
+        if ref == self._lost:
+            self._record("set_ref", full_name, ref, sha)
+            return
+        super().set_ref(full_name, ref, sha)
+
+
+def test_apply_layout_deletes_only_verified_copies(tmp_path, upstream, remote):
+    path, shas = upstream
+    sh(path, "push", "-q", remote, "refs/heads/*:refs/heads/*")
+    gh = LosesSetRef(tmp_path / "remote.git", "heads/upstream/feature/x")
+    gh.add_upstream(TARGET, branches=shas)
+    ev = Events()
+    run(gh, tmp_path, remote, shas, ev=ev)
+    heads = remote_heads(tmp_path)
+    assert heads["feature/x"] == shas["feature/x"]  # its copy is missing: not deleted
+    assert "main" not in heads and "ttgf0p2" not in heads
+    assert ("delete-skipped", {"target": TARGET, "branch": "feature/x"}) in ev
+
+
+def test_apply_layout_laid_out_skips_df_clash(tmp_path, upstream, remote):
+    """Once laid out, a new original `feature` cannot become upstream/feature next to
+    upstream/feature/x: it is skipped, logged and counted, and not named in bench.yaml."""
+    gh, shas = setup(tmp_path, upstream, remote)
+    run(gh, tmp_path, remote, shas)
+    Git(tmp_path / "remote.git").update_ref("refs/heads/feature", shas["main"])
+    n = len(gh.calls)
+    ev = Events()
+    assert run(gh, tmp_path, remote, shas, ev=ev) == "ok: 3 upstream, 1 tapeout, 1 mismatch"
+    assert writes(gh)[n:] == []
+    assert remote_heads(tmp_path)["feature"] == shas["main"]
+    assert ("branch-conflict", {"target": TARGET, "branch": "feature", "new": "upstream/feature"}) in ev
+    data = yaml.safe_load(Git(tmp_path / "remote.git").show("refs/heads/about", "bench.yaml"))
+    assert "upstream/feature" not in data["branches"]
+
+
+def test_run_layouts_validates_org_before_any_write(tmp_path, upstream, remote):
+    gh, _ = setup(tmp_path, upstream, remote)
+    bad = RepoPlan(RepoRef("github.com", "b", "x"), "b/x", "live", "b/x", "main", 1, "fork", "other-org/b--x")
+    try:
+        run_layouts([plan(), bad], {}, gh, cfg(tmp_path), ORG, remote_fmt=remote, log=Events(),
+                    now=lambda: NOW, sleep=Sleeps())  # fmt: skip
+    except ValueError as e:
+        assert "other-org/b--x" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+    assert writes(gh) == []
