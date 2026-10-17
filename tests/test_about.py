@@ -155,3 +155,13 @@ def test_about_commit_is_orphan_then_linear(tmp_path):
         ["git", "log", "-1", "--format=%s", second], cwd=g.path, capture_output=True, text=True, check=True
     )
     assert msg.stdout.strip() == "Update bench.yaml and README"
+
+
+def test_readme_links_tapeout_branch_only_when_present():
+    """A tapeout whose commit is missing gets no branch: its tag is shown without a link."""
+    missing = "tapeout/tinytapeout/ttgf0p3/tt_um_urish_simon"
+    d = about_data(plan(), tapeouts(), [b for b in BRANCHES if b != missing], NOW)
+    readme = render_readme(d, REPO_FULL)
+    assert f"/tree/{missing})" not in readme
+    assert "| `tinytapeout/ttgf0p3/tt_um_urish_simon` |" in readme
+    assert "[`tinytapeout/ttgf0p2/tt_um_urish_simon`](https://github.com/" in readme

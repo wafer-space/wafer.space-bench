@@ -22,7 +22,7 @@ class NotFound(GitHubError):
 
 
 class RateLimited(GitHubError):
-    """GitHub's (secondary) rate limit refused the call; back off and retry."""
+    """GitHub's primary or secondary rate limit refused the call; back off and retry."""
 
 
 @dataclass(frozen=True)
@@ -72,7 +72,12 @@ def _q(s: str) -> str:
 def _classify(cmd: list[str], stderr: str) -> GitHubError:
     msg = f"{' '.join(cmd[:5])}: {stderr}"
     low = stderr.lower()
-    if "too quickly" in low or "secondary rate limit" in low:
+    if (
+        "too quickly" in low
+        or "secondary rate limit" in low
+        or "rate limit exceeded" in low  # primary limit: "API rate limit exceeded for ..."
+        or "HTTP 429" in stderr
+    ):
         return RateLimited(msg)
     if "HTTP 404" in stderr:
         return NotFound(msg)
@@ -137,7 +142,15 @@ class GhCli:
         )["full_name"]
 
     def branches_visible(self, full_name: str) -> bool:
-        return bool(self._api(f"repos/{full_name}/branches?per_page=1"))
+        """False while a new fork is not ready yet: no branches, 404 or 409 (empty repo)."""
+        try:
+            return bool(self._api(f"repos/{full_name}/branches?per_page=1"))
+        except NotFound:
+            return False
+        except GitHubError as e:
+            if "HTTP 409" in str(e):
+                return False
+            raise
 
     def get_tag(self, full_name: str, tag: str) -> str | None:
         try:

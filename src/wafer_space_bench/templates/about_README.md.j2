@@ -13,7 +13,7 @@ Part of the [wafer.space GF180 benchmark]({{ index }}): open silicon designs re-
 | Org | Run | Slot | Project | Size | Commit | Tag / branch |
 |---|---|---|---|---|---|---|
 {% for t in tapeouts %}
-| {{ t.org }} | {% if t.page %}[{{ t.run }}]({{ t.page }}){% else %}{{ t.run }}{% endif %} | {{ t.slot }} | {{ t.project }} | {{ t.size }} | `{{ t.commit[:12] }}` | [`{{ t.tag }}`](https://github.com/{{ repo_full }}/tree/{{ t.branch }}) |
+| {{ t.org }} | {% if t.page %}[{{ t.run }}]({{ t.page }}){% else %}{{ t.run }}{% endif %} | {{ t.slot }} | {{ t.project }} | {{ t.size }} | `{{ t.commit[:12] }}` | {% if t.branch in branches %}[`{{ t.tag }}`](https://github.com/{{ repo_full }}/tree/{{ t.branch }}){% else %}`{{ t.tag }}`{% endif %} |
 {% endfor %}
 
 ## Branches

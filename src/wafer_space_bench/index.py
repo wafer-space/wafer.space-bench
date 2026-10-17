@@ -18,7 +18,11 @@ Log = Callable[..., None]  # log(event: str, **fields)
 
 def _read_bench_yaml(gh: GitHub, full: str, log: Log) -> dict | None:
     """The parsed bench.yaml of a laid-out repo; None (with a log line) if it is unusable."""
-    text = gh.get_file(full, "bench.yaml", "about")
+    try:
+        text = gh.get_file(full, "bench.yaml", "about")
+    except (ValueError, TypeError, KeyError) as e:  # not UTF-8 or not base64, or not a file
+        log("index-bad-yaml", repo=full, error=f"{type(e).__name__}: {e}"[:200])
+        return None
     if text is None:
         return None
     try:
@@ -60,14 +64,24 @@ def _from_catalog(row: dict, tapeouts: list[Tapeout]) -> None:
     row["licence"] = next((t.licence for t in tapeouts if t.licence), "")
 
 
+def _https(value) -> str | None:
+    """`value` if it is an https:// URL (safe as a link), else None."""
+    return value if isinstance(value, str) and value.startswith("https://") else None
+
+
 def _from_bench_yaml(row: dict, data: dict) -> None:
+    """Fill `row` from bench.yaml. Links are taken only if https://; else the plan's stay."""
     source = data.get("source")
     source = source if isinstance(source, dict) else {}
     tapeouts = [t for t in data.get("tapeouts") or [] if isinstance(t, dict)]
     branches = data.get("branches") or []
-    if source.get("url"):
-        row["upstream"] = str(source["url"])
-        row["original_upstream"] = str(source.get("original_url") or source["url"])
+    url = _https(source.get("url"))
+    if url:
+        row["upstream"] = url
+        if source.get("original_url"):
+            row["original_upstream"] = _https(source["original_url"]) or row["original_upstream"]
+        else:
+            row["original_upstream"] = url
     row["tapeouts"] = [str(t.get("tag", "")) for t in tapeouts]
     row["runs"] = _runs([(str(t.get("org", "")), str(t.get("run", ""))) for t in tapeouts])
     row["licence"] = str(source.get("licence") or "")
@@ -120,8 +134,7 @@ def _index(args) -> int:
     plans = read_plans(args.plans)
     tapeouts = tapeouts_by_repo(load_designs(args.catalog))
     rows = index_rows(plans, tapeouts, GhCli(), args.org, log=log)
-    site_dir = args.plans.parent.parent / "site"
-    write_site(rows, site_dir, args.out)
+    write_site(rows, args.site, args.out)
     counts = dict(sorted(collections.Counter(r["state"] for r in rows).items()))
     log("index", repos=len(rows), counts=counts)
     print(f"index: {len(rows)} repos, " + ", ".join(f"{k} {n}" for k, n in counts.items()))
@@ -131,4 +144,7 @@ def _index(args) -> int:
 def add_subcommand(subparsers) -> None:
     p = subparsers.add_parser("index", help="build the index site source from the org's repos")
     p.add_argument("--out", type=Path, required=True, help="directory to write the Jekyll source to")
+    p.add_argument(
+        "--site", type=Path, default=Path("site"), help="site template directory (default: ./site)"
+    )
     p.set_defaults(handler=_index)

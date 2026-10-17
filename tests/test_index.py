@@ -200,6 +200,7 @@ def test_cli_index_writes_site(tmp_path, monkeypatch):
     import shutil
 
     shutil.copytree(SITE, tmp_path / "site")
+    monkeypatch.chdir(tmp_path)
     out = tmp_path / "out"
     log = tmp_path / "events.jsonl"
     rc = main(
@@ -211,3 +212,80 @@ def test_cli_index_writes_site(tmp_path, monkeypatch):
     assert rows[0]["state"] == "created"
     ev = [json.loads(line) for line in log.read_text().splitlines()]
     assert ev[-1]["event"] == "index" and ev[-1]["counts"] == {"created": 1}
+
+
+# --- final review: robustness and site location ---------------------------------
+
+
+class BadFiles(FakeGitHub):
+    """get_file fails like GhCli does on non-UTF-8 content or a directory listing."""
+
+    def get_file(self, full_name, path, ref):
+        if full_name.endswith("--binary"):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        if full_name.endswith("--dir"):
+            raise TypeError("list indices must be integers or slices, not str")
+        return super().get_file(full_name, path, ref)
+
+
+def test_index_undecodable_bench_yaml_is_logged_not_crash():
+    gh = BadFiles()
+    for n in ("a--binary", "b--dir", "c--ok"):
+        org_repo(gh, f"{ORG}/{n}", "about")
+    gh.files[(f"{ORG}/c--ok", "about", "bench.yaml")] = bench_yaml()
+    log = Events()
+    rows = index_rows([plan("a/binary"), plan("b/dir"), plan("c/ok")], {}, gh, ORG, log=log)
+    assert {r["name"]: r["state"] for r in rows} == {
+        "a--binary": "created",
+        "b--dir": "created",
+        "c--ok": "laid-out",
+    }
+    assert [f["repo"] for e, f in log if e == "index-bad-yaml"] == [f"{ORG}/a--binary", f"{ORG}/b--dir"]
+
+
+def test_index_hrefs_from_bench_yaml_must_be_https():
+    gh = FakeGitHub()
+    org_repo(gh, f"{ORG}/a--up", "about")
+    gh.files[(f"{ORG}/a--up", "about", "bench.yaml")] = bench_yaml(
+        source={"url": "javascript:alert(1)", "original_url": "http://github.com/a/up", "licence": "MIT"}
+    )
+    (row,) = index_rows([plan("a/up", current="a/renamed")], {}, gh, ORG)
+    assert row["state"] == "laid-out"
+    assert row["upstream"] == "https://github.com/a/renamed"  # the plan's value
+    assert row["original_upstream"] == "https://github.com/a/up"
+    gh.files[(f"{ORG}/a--up", "about", "bench.yaml")] = bench_yaml(
+        source={"url": "https://github.com/z/new", "original_url": "ftp://x/y", "licence": "MIT"}
+    )
+    (row,) = index_rows([plan("a/up", current="a/renamed")], {}, gh, ORG)
+    assert row["upstream"] == "https://github.com/z/new"
+    assert row["original_upstream"] == "https://github.com/a/up"
+
+
+def _index_cli_setup(tmp_path, monkeypatch):
+    gh = FakeGitHub()
+    org_repo(gh, f"{ORG}/a--up")
+    monkeypatch.setattr("wafer_space_bench.index.GhCli", lambda: gh)
+    plans = tmp_path / "elsewhere" / "deep" / "plans.csv"
+    write_plans(plans, [plan()])
+    cat = tmp_path / "designs.csv"
+    cat.write_text("pool,shuttle,code,project,repo,commit,licence,kind,size\n")
+    base = ["--org", ORG, "--catalog", str(cat), "--plans", str(plans), "--log", str(tmp_path / "e.jsonl")]
+    return base
+
+
+def test_cli_index_site_dir_is_cwd_site_not_next_to_plans(tmp_path, monkeypatch):
+    import shutil
+
+    base = _index_cli_setup(tmp_path, monkeypatch)
+    root = tmp_path / "root"
+    shutil.copytree(SITE, root / "site")
+    monkeypatch.chdir(root)
+    assert main([*base, "index", "--out", str(tmp_path / "out")]) == 0
+    assert (tmp_path / "out" / "index.md").exists()
+
+
+def test_cli_index_site_option(tmp_path, monkeypatch):
+    base = _index_cli_setup(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)  # no site/ here
+    assert main([*base, "index", "--site", str(SITE), "--out", str(tmp_path / "out")]) == 0
+    assert (tmp_path / "out" / "_config.yml").exists()

@@ -448,3 +448,30 @@ def test_fake_create_repo_list_and_misc(gh):
         "set_default_branch",
         "dispatch",
     ]
+
+
+# --- final review: primary rate limit, branches_visible ---------------------
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        "gh: API rate limit exceeded for installation ID 1. (HTTP 403)",
+        "gh: API rate limit exceeded for user ID 1. (HTTP 429)",
+        "gh: Too Many Requests (HTTP 429)",
+    ],
+)
+def test_ghcli_primary_rate_limit_is_rate_limited(err):
+    with pytest.raises(RateLimited):
+        GhCli(runner=Stub(fail(err))).get_repo("a/b")
+
+
+def test_ghcli_branches_visible_false_on_404_and_409():
+    gh = GhCli(runner=Stub(fail("gh: Not Found (HTTP 404)"), fail("gh: Git Repository is empty. (HTTP 409)")))
+    assert gh.branches_visible("o/x") is False
+    assert gh.branches_visible("o/x") is False
+
+
+def test_ghcli_branches_visible_other_error_raises():
+    with pytest.raises(GitHubError):
+        GhCli(runner=Stub(fail("gh: Server Error (HTTP 500)"))).branches_visible("o/x")
