@@ -18,14 +18,16 @@ A second run with nothing new upstream makes no writes.
 
 import argparse
 import time
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from wafer_space_bench.catalog import Tapeout, load_designs, tapeouts_by_repo
 from wafer_space_bench.config import LocalConfig, load_config, resolve_clone_url
 from wafer_space_bench.copy import copy_why, local_clone_path
 from wafer_space_bench.events import EventLog
-from wafer_space_bench.fork import Log, ensure_tags, plan_matches, retry_rate_limited
+from wafer_space_bench.fork import Log, ensure_tags, plan_matches, retry_rate_limited, select_only
 from wafer_space_bench.git import Git, GitError
 from wafer_space_bench.github import GhCli, GitHub, GitHubError, NotFound
 from wafer_space_bench.layout import about_repo, apply_layout, push_about
@@ -250,12 +252,15 @@ def run_sync(
     delay: float = 2,
     sleep: Callable[[float], None] = time.sleep,
     shard: tuple[int, int] | None = None,
+    dispatch: bool = True,
+    changed_file: Path | None = None,
 ) -> int:
     """sync_repo every fork/copy/restore plan (only those `only` names, if given), logging one
     `sync` event each and sleeping `delay` after each repo that wrote. If any repo changed
-    (and this is not a dry run), dispatch `bench-updated` to `index_repo` once at the end.
-    `shard` (K, N) keeps only the plans at 0-based positions i with i % N == K - 1 in the
-    sorted, `only`-filtered list, so shards 1..N partition the plans.
+    (and this is not a dry run): write `changed_file` (a marker, if given), and unless
+    `dispatch` is False dispatch `bench-updated` to `index_repo` once at the end.
+    `shard` (K, N) keeps only the plans with `shard_of(target, N) == K`, a stable hash, so
+    shards 1..N partition the plans and adding a plan never moves another.
     Returns the number of repos that ended in an error or a layout conflict."""
     todo = sorted((p for p in plans if p.strategy in STRATEGIES), key=lambda p: (p.source.key, p.target))
     if only:
@@ -263,7 +268,7 @@ def run_sync(
         todo = [p for p in todo if plan_matches(p, names)]
     if shard is not None:
         k, n = _check_shard(*shard)
-        todo = [p for i, p in enumerate(todo) if i % n == k - 1]
+        todo = [p for p in todo if shard_of(p.target, n) == k]
     outside = [p.target for p in todo if p.target.split("/", 1)[0].lower() != org.lower()]
     if outside:  # checked before any repo is touched
         raise ValueError(f"not in {org}: {', '.join(outside)}")
@@ -294,7 +299,10 @@ def run_sync(
             print(f"synced {i}/{len(todo)}", flush=True)
         if (ok or status.startswith("error:")) and i < len(todo):
             sleep(delay)
-    if changed and not dry_run:
+    if changed and not dry_run and changed_file is not None:
+        changed_file.parent.mkdir(parents=True, exist_ok=True)
+        changed_file.write_text("changed\n")
+    if changed and not dry_run and dispatch:
         try:
             retry_rate_limited(
                 lambda: gh.dispatch(index_repo, "bench-updated"), sleep=sleep, log=log, target=index_repo
@@ -304,6 +312,12 @@ def run_sync(
             log("dispatch", target=index_repo, event_type="bench-updated", status=f"error: {e}")
             print(f"dispatch to {index_repo} failed: {e}", flush=True)
     return failed
+
+
+def shard_of(target: str, n: int) -> int:
+    """The 1-based shard (of `n`) that bench repo `target` belongs to: a stable hash of its
+    lowercased name, so a plan's shard (and its mirror cache) never depends on other plans."""
+    return zlib.crc32(target.lower().encode()) % n + 1
 
 
 def _check_shard(k: int, n: int) -> tuple[int, int]:
@@ -328,8 +342,11 @@ def _now() -> str:
 
 
 def _sync_cmd(args) -> int:
+    plans = read_plans(args.plans)
+    if select_only(plans, args.only, STRATEGIES, "sync") is None:  # checked before sharding
+        return 2
     failed = run_sync(
-        read_plans(args.plans),
+        plans,
         tapeouts_by_repo(load_designs(args.catalog)),
         GhCli(),
         load_config(args.config),
@@ -341,6 +358,8 @@ def _sync_cmd(args) -> int:
         log=EventLog(args.log).write,
         delay=args.delay,
         shard=args.shard,
+        dispatch=not args.no_dispatch,
+        changed_file=args.changed_file,
     )
     return 1 if failed else 0
 
@@ -356,6 +375,14 @@ def add_subcommand(subparsers) -> None:
         "--shard",
         type=parse_shard,
         metavar="K/N",
-        help="only the K-th of N interleaved slices of the plans (1-based K)",
+        help="only the K-th of N slices of the plans (1-based K; by a stable hash of the bench name)",
+    )
+    p.add_argument(
+        "--no-dispatch",
+        action="store_true",
+        help=f"do not dispatch bench-updated to {INDEX_REPO} (the workflow does it once for all shards)",
+    )
+    p.add_argument(
+        "--changed-file", type=Path, metavar="PATH", help="write this marker file if any repo changed"
     )
     p.set_defaults(handler=_sync_cmd)

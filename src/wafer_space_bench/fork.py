@@ -1,5 +1,6 @@
 """Fork upstream repos into the bench org and tag their taped-out commits."""
 
+import sys
 import time
 from collections.abc import Callable
 from typing import Any, Literal
@@ -165,11 +166,29 @@ def plan_matches(p: RepoPlan, only: set[str]) -> bool:
     return bool(names & only)
 
 
+def select_only(
+    plans: list[RepoPlan], only: list[str] | None, strategies: tuple[str, ...], command: str
+) -> list[RepoPlan] | None:
+    """The plans named by `only` (all of them if `only` is empty). None, after a warning on
+    stderr, if `only` names none of the plans with `strategies` (the command's own): the
+    caller exits 2 rather than silently doing nothing."""
+    if not only:
+        return plans
+    names = {o.lower() for o in only}
+    picked = [p for p in plans if plan_matches(p, names)]
+    if not any(p.strategy in strategies for p in picked):
+        print(
+            f"wsbench {command}: warning: --only matched no {'/'.join(strategies)} plan: {' '.join(only)}",
+            file=sys.stderr,
+        )
+        return None
+    return picked
+
+
 def _fork(args) -> int:
-    plans = read_plans(args.plans)
-    if args.only:
-        only = {o.lower() for o in args.only}
-        plans = [p for p in plans if plan_matches(p, only)]
+    plans = select_only(read_plans(args.plans), args.only, ("fork",), "fork")
+    if plans is None:
+        return 2
     tapeouts = tapeouts_by_repo(load_designs(args.catalog))
     log = EventLog(args.log).write
     failed = run_fork(plans, tapeouts, GhCli(), args.org, delay=args.delay, log=log)

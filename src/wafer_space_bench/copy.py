@@ -18,7 +18,7 @@ from pathlib import Path
 from wafer_space_bench.catalog import Tapeout, load_designs, tapeouts_by_repo
 from wafer_space_bench.config import LocalConfig, load_config, resolve_clone_url
 from wafer_space_bench.events import EventLog
-from wafer_space_bench.fork import Log, plan_matches, retry_rate_limited, tag_message
+from wafer_space_bench.fork import Log, retry_rate_limited, select_only, tag_message
 from wafer_space_bench.git import Git, GitError
 from wafer_space_bench.github import GhCli, GitHub, GitHubError, NotFound
 from wafer_space_bench.naming import COMMIT_SOURCE
@@ -219,10 +219,9 @@ def run_copies(
 
 
 def _copy(args) -> int:
-    plans = read_plans(args.plans)
-    if args.only:
-        only = {o.lower() for o in args.only}
-        plans = [p for p in plans if plan_matches(p, only)]
+    plans = select_only(read_plans(args.plans), args.only, STRATEGIES, "copy")
+    if plans is None:
+        return 2
     failed = run_copies(
         plans,
         tapeouts_by_repo(load_designs(args.catalog)),

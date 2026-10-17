@@ -1,9 +1,10 @@
 name: Sync
 
 # Sharded (ruling R14): an App installation token lasts 60 minutes, so the plans are split
-# into 8 interleaved shards, each a job that mints its own token and must finish within
-# 60 minutes. Each shard that changed something dispatches `bench-updated` to the index
-# repo; pages.yml's concurrency group serialises the resulting builds.
+# into 8 shards (by a stable hash of the bench repo name), each a job that mints its own
+# token and must finish within 60 minutes. Shards do not dispatch the index themselves:
+# each one that changed something puts a `changed` marker in its artifact, and the
+# `notify` job dispatches `bench-updated` to the index repo once for the whole run.
 
 on:
   schedule:
@@ -37,7 +38,7 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ vars.BENCH_APP_ID }}
           private-key: ${{ secrets.BENCH_APP_PRIVATE_KEY }}
@@ -46,7 +47,7 @@ jobs:
         with:
           # git must authenticate with the app token (via gh), not this repo's GITHUB_TOKEN
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - run: uv sync --locked
       - name: Let git use the app token
         env:
@@ -66,7 +67,7 @@ jobs:
           SHARD: ${{ matrix.shard }}
         run: |
           mkdir -p work/mirrors
-          args=(--shard "$SHARD/8")
+          args=(--shard "$SHARD/8" --no-dispatch --changed-file work/changed)
           read -ra names <<< "$ONLY"
           if [ "${#names[@]}" -gt 0 ]; then
             args+=(--only "${names[@]}")
@@ -85,5 +86,42 @@ jobs:
         if: always()
         with:
           name: sync-events-${{ matrix.shard }}
-          path: work/events.jsonl
+          path: |
+            work/events.jsonl
+            work/changed
           if-no-files-found: ignore
+
+  # One index rebuild per run, not one per shard: the dispatch is a write that the index
+  # repo's GITHUB_TOKEN-limited build pays for, so it happens once, if any shard changed.
+  notify:
+    needs: sync
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        # No artifact at all (every shard failed early) is not an error here.
+        continue-on-error: true
+        with:
+          pattern: sync-events-*
+          path: shards
+      - id: changed
+        name: Did any shard change something?
+        run: |
+          if [ -d shards ] && find shards -name changed -type f | grep -q .; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+      - id: app-token
+        if: steps.changed.outputs.any == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.BENCH_APP_ID }}
+          private-key: ${{ secrets.BENCH_APP_PRIVATE_KEY }}
+          owner: wafer-space-bench
+      - name: Dispatch bench-updated to the index repo
+        if: steps.changed.outputs.any == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh api -X POST repos/wafer-space-bench/wafer-space-bench.github.io/dispatches -f event_type=bench-updated

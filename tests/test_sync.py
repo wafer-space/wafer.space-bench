@@ -25,7 +25,15 @@ from wafer_space_bench.github import GitHubError
 from wafer_space_bench.layout import apply_layout
 from wafer_space_bench.naming import RepoRef
 from wafer_space_bench.scan import RepoPlan, write_plans
-from wafer_space_bench.sync import MirrorPlan, parse_shard, plan_mirror, run_sync, sync_repo
+from wafer_space_bench.sync import (
+    INDEX_REPO,
+    MirrorPlan,
+    parse_shard,
+    plan_mirror,
+    run_sync,
+    shard_of,
+    sync_repo,
+)
 
 ORG = "wafer-space-bench"
 UP = "a/upstream"
@@ -534,14 +542,30 @@ def test_run_sync_shards_partition_plans(n):
     shards = [set(synced_targets(list(reversed(plans)), shard=(k, n))[1]) for k in range(1, n + 1)]
     assert set().union(*shards) == every
     assert sum(len(s) for s in shards) == len(every)  # pairwise disjoint
-    assert synced_targets(plans, shard=(2, 3))[1] == [f"{ORG}/o--r{i:02d}" for i in (1, 4, 7, 10)]
+    want = [p.target for p in plans if shard_of(p.target, 3) == 2]
+    assert synced_targets(plans, shard=(2, 3))[1] == want
+
+
+def test_shard_is_a_stable_hash_of_the_target():
+    """Adding or removing a plan never moves another plan to a different shard (its
+    mirror cache is per shard), and the shard ignores the target's case."""
+    import zlib
+
+    assert shard_of(f"{ORG}/O--R01", 8) == shard_of(f"{ORG}/o--r01", 8)
+    assert shard_of(f"{ORG}/o--r01", 8) == zlib.crc32(f"{ORG}/o--r01".encode()) % 8 + 1
+    plans = pending_plans(20)
+    before = {k: synced_targets(plans[1:], shard=(k, 4))[1] for k in range(1, 5)}
+    after = {k: synced_targets(plans, shard=(k, 4))[1] for k in range(1, 5)}
+    for k in range(1, 5):
+        assert [t for t in after[k] if t != plans[0].target] == before[k]
 
 
 def test_run_sync_shard_after_only():
     plans = pending_plans(6)
     only = ["o/r01", "o/r02", "o/r04", "o/r05"]
-    assert synced_targets(plans, only=only, shard=(1, 2))[1] == [f"{ORG}/o--r01", f"{ORG}/o--r04"]
-    assert synced_targets(plans, only=only, shard=(2, 2))[1] == [f"{ORG}/o--r02", f"{ORG}/o--r05"]
+    for k in (1, 2):
+        want = [f"{ORG}/o--r{i:02d}" for i in (1, 2, 4, 5) if shard_of(f"{ORG}/o--r{i:02d}", 2) == k]
+        assert synced_targets(plans, only=only, shard=(k, 2))[1] == want
 
 
 def test_parse_shard():
@@ -644,7 +668,8 @@ def test_sync_workflow_shape():
     assert inputs["dry_run"]["type"] == "boolean" and inputs["dry_run"]["default"] is False
     assert wf["concurrency"] == {"group": "sync", "cancel-in-progress": False}
     assert wf["permissions"] == {"contents": "read"}
-    (job,) = wf["jobs"].values()
+    assert set(wf["jobs"]) == {"sync", "notify"}
+    job = wf["jobs"]["sync"]
     assert job["timeout-minutes"] == 60
     assert job["strategy"] == {
         "fail-fast": False,
@@ -652,7 +677,7 @@ def test_sync_workflow_shape():
         "matrix": {"shard": [1, 2, 3, 4, 5, 6, 7, 8]},
     }
     uses = [s.get("uses", "") for s in job["steps"]]
-    assert uses[0] == "actions/create-github-app-token@v2"
+    assert uses[0].startswith("actions/create-github-app-token@")
     assert job["steps"][0]["with"] == {
         "app-id": "${{ vars.BENCH_APP_ID }}",
         "private-key": "${{ secrets.BENCH_APP_PRIVATE_KEY }}",
@@ -669,10 +694,83 @@ def test_sync_workflow_shape():
     assert save["if"] == "always()" and save["with"] == {"path": "work/mirrors", "key": key}
     assert "actions/cache@v4" not in uses  # it would skip saving when sync exits 1
     upload = next(s for s in job["steps"] if s.get("uses") == "actions/upload-artifact@v4")
-    assert upload["if"] == "always()" and upload["with"]["path"] == "work/events.jsonl"
+    assert upload["if"] == "always()" and "work/events.jsonl" in upload["with"]["path"].split()
     assert "${{ matrix.shard }}" in upload["with"]["name"]
     step = next(s for s in job["steps"] if "wsbench" in s.get("run", ""))
     run = step["run"]
     assert "--remote-fmt 'https://github.com/{full}.git'" in run and "--log work/events.jsonl" in run
     assert step["env"]["SHARD"] == "${{ matrix.shard }}" and '--shard "$SHARD/8"' in run
     assert '"${#names[@]}" -gt 0' in run  # a whitespace-only `only` adds no bare --only
+
+
+# --- final review: one index dispatch per sync run (I3) -------------------------
+
+
+def test_run_sync_no_dispatch_writes_changed_marker(tmp_path, upstream):
+    gh = SyncedFake()
+    plans, tos, paths, fmt = three_benches(tmp_path, upstream, gh)
+    marker = tmp_path / "out" / "changed"
+    kw = {"only": None, "dry_run": False, "remote_fmt": fmt, "now": NOW, "sleep": Sleeps()}
+    assert run_sync(plans, tos, gh, cfg(tmp_path), ORG, log=Events(), dispatch=False, changed_file=marker,
+                    **kw) == 0  # fmt: skip
+    assert not marker.exists()  # nothing changed
+    change_upstream(upstream)
+    for up, p in zip(["a/up1", "a/up2", "a/up3"], paths, strict=True):
+        publish(gh, upstream, up, [p])
+    assert run_sync(plans, tos, gh, cfg(tmp_path), ORG, log=Events(), dispatch=False, changed_file=marker,
+                    **kw) == 0  # fmt: skip
+    assert marker.exists()
+    assert gh.dispatches == []
+
+
+def test_run_sync_dry_run_writes_no_marker(tmp_path, upstream):
+    gh = SyncedFake()
+    plans, tos, paths, fmt = three_benches(tmp_path, upstream, gh)
+    change_upstream(upstream)
+    for up, p in zip(["a/up1", "a/up2", "a/up3"], paths, strict=True):
+        publish(gh, upstream, up, [p])
+    marker = tmp_path / "changed"
+    run_sync(plans, tos, gh, cfg(tmp_path), ORG, dry_run=True, remote_fmt=fmt, now=NOW, log=Events(),
+             sleep=Sleeps(), dispatch=False, changed_file=marker)  # fmt: skip
+    assert not marker.exists()
+
+
+def test_cli_sync_no_dispatch_and_changed_file(tmp_path, upstream, remote, monkeypatch):
+    path = remote_path(remote)
+    gh = bench_fork(tmp_path, upstream, path)
+    gh.add_upstream(INDEX)
+    change_upstream(upstream)
+    publish(gh, upstream, UP, [path])
+    write_plans(tmp_path / "plans.csv", [mkplan()])
+    cat = tmp_path / "designs.csv"
+    cat.write_text("pool,shuttle,code,project,repo,commit,licence,kind,size\n")
+    monkeypatch.setattr("wafer_space_bench.sync.GhCli", lambda: gh)
+    base = ["--plans", str(tmp_path / "plans.csv"), "--catalog", str(cat), "--log", str(tmp_path / "e.jsonl"),
+            "--config", str(tmp_path / "none.toml"), "--remote-fmt", remote]  # fmt: skip
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "work" / "changed"
+    assert main([*base, "sync", "--delay", "0", "--no-dispatch", "--changed-file", str(marker)]) == 0
+    assert marker.exists() and gh.dispatches == []
+
+
+def test_sync_workflow_dispatches_once_from_a_notify_job():
+    wf = _workflow()
+    sync_job, notify = wf["jobs"]["sync"], wf["jobs"]["notify"]
+    run = next(s for s in sync_job["steps"] if "wsbench" in s.get("run", ""))["run"]
+    assert "--no-dispatch" in run and "--changed-file work/changed" in run
+    upload = next(s for s in sync_job["steps"] if s.get("uses", "").startswith("actions/upload-artifact@"))
+    assert upload["with"]["path"].split() == ["work/events.jsonl", "work/changed"]
+    assert notify["needs"] == "sync" and notify["if"] == "always()"
+    steps = notify["steps"]
+    download = next(s for s in steps if s.get("uses", "").startswith("actions/download-artifact@"))
+    assert download["with"]["pattern"] == "sync-events-*"
+    token = next(s for s in steps if s.get("uses", "").startswith("actions/create-github-app-token@"))
+    assert token["with"]["owner"] == "wafer-space-bench"
+    dispatch = next(s for s in steps if "dispatches" in s.get("run", ""))
+    assert dispatch["env"]["GH_TOKEN"] == "${{ steps.app-token.outputs.token }}"
+    assert (
+        f"repos/{INDEX_REPO}/dispatches" in dispatch["run"] and "event_type=bench-updated" in dispatch["run"]
+    )
+    assert dispatch["if"] == token["if"] == "steps.changed.outputs.any == 'true'"
+    runs = [s["run"] for s in steps if "run" in s]
+    assert all("${{" not in r for r in runs)
