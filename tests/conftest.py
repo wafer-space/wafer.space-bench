@@ -14,6 +14,10 @@ def _isolated_git(monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+    # CI runners have no derivable identity; direct `git tag -a` / `git commit` calls need one.
+    for who in ("AUTHOR", "COMMITTER"):
+        monkeypatch.setenv(f"GIT_{who}_NAME", "test")
+        monkeypatch.setenv(f"GIT_{who}_EMAIL", "test@example.invalid")
 
 
 def _git(path, *args) -> str:
