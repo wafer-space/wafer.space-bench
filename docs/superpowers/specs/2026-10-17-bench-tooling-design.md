@@ -78,6 +78,12 @@ action appends one JSON line to an event log.
 2. `fork`: create forks and tapeout tags.
 3. `copy`: create copy/restore repos, push branches and tags.
 4. `layout`: apply the branch namespaces and generate the `about` branch.
+   Branches are written with git, not the REST refs API (one API write per ref
+   would eat the secondary write limit): from the repo's local bare clone
+   (seeded from a local mirror when there is one, which is only read), one
+   atomic push creates every `upstream/*` and `tapeout/*` branch, the default
+   branch is set to `about` through the API, then one atomic push with
+   `--force-with-lease` deletes the original branches that have not moved.
 5. `sync`: keep existing bench repos current (see Automation).
 6. `index`: generate the index site data by reading the bench repos.
 

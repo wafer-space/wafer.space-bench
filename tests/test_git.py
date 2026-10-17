@@ -170,3 +170,28 @@ def test_fetch_depth(tmp_path, upstream):
     g.fetch(path.as_uri(), ["+refs/heads/ttgf0p2:refs/heads/x"], depth=1, no_tags=True)
     assert g.rev_parse("refs/heads/x") == shas["ttgf0p2"]
     assert g.rev_parse("refs/heads/x~1") is None  # shallow: the parent was not fetched
+
+
+def test_push_leased_creates_deletes_and_is_atomic(tmp_path, upstream, remote):
+    path, shas = upstream
+    g = Git.clone_bare(str(path), tmp_path / "c.git")
+    r = Git(tmp_path / "remote.git")
+    g.push_leased(remote, {"refs/heads/a": (None, shas["main"]), "refs/heads/b": (None, shas["ttgf0p2"])})
+    g.push_leased(remote, {"refs/heads/a": (None, shas["main"])})  # already there: a no-op
+    assert sorted(r.heads()) == ["a", "b"]
+    with pytest.raises(GitError) as e:  # `b` is not at the lease: nothing changes
+        g.push_leased(remote, {"refs/heads/a": (shas["main"], None), "refs/heads/b": (shas["main"], None)})
+    assert sorted(r.heads()) == ["a", "b"]
+    assert "stale info" in str(e.value) and str(e.value).count("--force-with-lease") == 1
+    assert str(tmp_path) not in str(e.value)
+    with pytest.raises(GitError):  # creation only: an existing branch is never moved
+        g.push_leased(remote, {"refs/heads/a": (None, shas["feature/x"])})
+    g.push_leased(remote, {"refs/heads/a": (shas["main"], None), "refs/heads/b": (shas["ttgf0p2"], None)})
+    assert r.heads() == []
+
+
+def test_clone_bare_from_local_path_copies_objects(tmp_path, upstream):
+    path, _ = upstream
+    g = Git.clone_bare(str(path), tmp_path / "c.git")
+    objects = [p for p in (g.path / "objects").rglob("*") if p.is_file()]
+    assert objects and all(p.stat().st_nlink == 1 for p in objects)

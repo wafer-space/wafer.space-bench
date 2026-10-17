@@ -63,7 +63,9 @@ def _run(args: list[str], cwd: Path | None = None, stdin: str | None = None, che
     if check and p.returncode != 0:
         # Only the subcommand and its options; arguments (local paths, URLs) are redacted
         # from stderr too, since error text can end up in shared event logs.
-        shown = " ".join([args[0], *(a for a in args[1:] if a.startswith("-"))])
+        # A --force-with-lease option is shown once, without its ref:sha value.
+        opts = (a.split("=", 1)[0] if a.startswith("--force-with-lease=") else a for a in args[1:])
+        shown = " ".join([args[0], *dict.fromkeys(a for a in opts if a.startswith("-"))])
         err = (p.stderr or "").strip()
         for a in _redactions(args, cwd):
             err = err.replace(a, "<arg>")
@@ -77,9 +79,12 @@ class Git:
 
     @classmethod
     def clone_bare(cls, url: str, dest: Path) -> "Git":
+        """A bare clone of `url` at `dest`. From a local path (a mirror) objects are copied,
+        never hardlinked, so nothing in `dest` shares an inode with the source."""
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        _run(["clone", "--bare", "--quiet", url, str(dest)])
+        local = ["--no-hardlinks"] if "://" not in url and Path(url).exists() else []
+        _run(["clone", "--bare", "--quiet", *local, url, str(dest)])
         return cls(dest)
 
     @classmethod
@@ -178,3 +183,14 @@ class Git:
     def push(self, remote: str, refspecs: list[str], *, atomic: bool = False) -> None:
         """Push `refspecs`; `atomic` updates either every ref or none."""
         self._git("push", "--quiet", *(["--atomic"] if atomic else []), remote, *refspecs)
+
+    def push_leased(self, remote: str, updates: dict[str, tuple[str | None, str | None]]) -> None:
+        """One atomic push of `updates` {ref: (old, new)}: each ref is set to commit `new`
+        (None deletes it) only if the remote has it at `old` (None: absent), checked with
+        --force-with-lease. A ref already at `new` is left alone (a no-op). If any ref is not
+        at its `old`, no ref is updated and GitError is raised."""
+        if not updates:
+            return
+        leases = [f"--force-with-lease={ref}:{old or ''}" for ref, (old, _) in updates.items()]
+        specs = [f"{new or ''}:{ref}" for ref, (_, new) in updates.items()]
+        self._git("push", "--quiet", "--atomic", *leases, remote, *specs)

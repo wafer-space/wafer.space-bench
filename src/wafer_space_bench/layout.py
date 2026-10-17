@@ -1,9 +1,15 @@
 """Lay out a bench repo's branches: `about` (default), `upstream/<b>`, `tapeout/<tag>`.
 
 A bench repo starts as a fork or pushed copy with upstream's own branch names. Laying it
-out is done without cloning it (ruling R10): `git ls-remote` lists its refs, the refs API
-creates `upstream/*` and `tapeout/*` branches from commits GitHub already has, and only
-the small orphan `about` commit is built in a local work repo and pushed.
+out: `git ls-remote` lists its refs and the layout is planned from those. The orphan
+`about` commit is built in a small work repo and pushed. Every other ref write is a git
+push from the repo's local bare clone (`work_dir/mirrors/<bench name>.git`, shared with
+`wsbench copy`), which has the commits: a missing clone is seeded from upstream (a local
+mirror when one exists, only ever cloned from), then the bench repo's own heads and tags
+are fetched under `refs/bench/`. One atomic push creates the new `upstream/*` and
+`tapeout/*` branches; the default branch is switched through the API; a second atomic
+push deletes the originals, each only if it and its `upstream/` copy are still where the
+listing saw them (--force-with-lease).
 
 Order matters for crash safety: `about` and every new branch exist before the default
 branch is switched, and the original branches are deleted only after the switch. A
@@ -17,7 +23,8 @@ from dataclasses import dataclass
 
 from wafer_space_bench.about import ABOUT_REF, about_data, render_readme, write_about_commit
 from wafer_space_bench.catalog import Tapeout, load_designs, tapeouts_by_repo
-from wafer_space_bench.config import LocalConfig, load_config
+from wafer_space_bench.config import LocalConfig, load_config, resolve_clone_url
+from wafer_space_bench.copy import local_clone_path, public_url
 from wafer_space_bench.events import EventLog
 from wafer_space_bench.fork import Log, retry_rate_limited, select_only
 from wafer_space_bench.git import Git, GitError
@@ -26,6 +33,9 @@ from wafer_space_bench.naming import COMMIT_SOURCE, classify_branch
 from wafer_space_bench.scan import RepoPlan, read_plans
 
 STRATEGIES = ("fork", "copy", "restore")
+# The bench repo's heads and tags, fetched under a private namespace: the clone's own
+# refs/heads and refs/tags (copy's upstream branches and tapeout tags) are never touched.
+BENCH_REFSPECS = ["+refs/heads/*:refs/bench/heads/*", "+refs/tags/*:refs/bench/tags/*"]
 
 
 @dataclass(frozen=True)
@@ -95,6 +105,23 @@ def about_repo(cfg: LocalConfig, target: str, remote: str, remote_has_about: boo
     the remote's (absent if the remote has none)."""
     git = _work_repo(cfg, target)
     _mirror_about(git, remote, remote_has_about)
+    return git
+
+
+def objects_repo(cfg: LocalConfig, plan: RepoPlan, remote: str, log: Log) -> Git:
+    """The local bare clone of `plan.target` holding every commit its bench repo's heads and
+    tags point at. A missing clone is seeded from upstream (a local mirror if one exists,
+    else the public URL); if that fails it starts empty and the fetch brings everything."""
+    dest = local_clone_path(cfg, plan.target)
+    if dest.exists():
+        git = Git(dest)
+    else:
+        try:
+            git = Git.clone_bare(resolve_clone_url(public_url(plan), cfg), dest)
+        except GitError as e:
+            log("seed-failed", target=plan.target, error=str(e))
+            git = Git.init_bare(dest)
+    git.fetch(remote, BENCH_REFSPECS, prune=True, no_tags=True)
     return git
 
 
@@ -178,19 +205,10 @@ def _layout(
     if dry_run:
         return f"dry-run: {counts}", False
 
-    changed = False
-
-    def write(fn: Callable[[], object], **context) -> None:
-        nonlocal changed
-        retry_rate_limited(fn, sleep=sleep, log=log, target=target, **context)
-        changed = True
-
-    if push_about(git, remote, plan, tapeouts, branches, now):
-        changed = True
-    moves = []
+    moves, create = [], {}
     for b, new in upstream.items():
         if new not in heads:
-            write(lambda new=new, b=b: gh.set_ref(target, f"heads/{new}", heads[b]), ref=new)
+            create[f"refs/heads/{new}"] = (None, heads[b])
         elif heads[new] != heads[b]:  # only possible once laid out (else a conflict): leave both
             log("upstream-mismatch", target=target, branch=b, branch_sha=heads[b], upstream_sha=heads[new])
             mismatches += 1
@@ -199,22 +217,28 @@ def _layout(
     for t in lp.tapeout:
         branch, commit = f"tapeout/{t}", tags[t]
         if branch not in heads:
-            write(
-                lambda branch=branch, commit=commit: gh.set_ref(target, f"heads/{branch}", commit), ref=branch
-            )
+            create[f"refs/heads/{branch}"] = (None, commit)
         elif heads[branch] != commit:  # tapeout branches are frozen: never moved
             log("tapeout-mismatch", target=target, branch=branch, branch_sha=heads[branch], tag_sha=commit)
             mismatches += 1
+    # Pushes need the commits locally; fetched before any write, so a failed fetch writes nothing.
+    objects = objects_repo(cfg, plan, remote, log) if create or moves else None
+    changed = push_about(git, remote, plan, tapeouts, branches, now)
+    if create:  # creations only: a branch that appeared since the listing fails the push
+        objects.push_leased(remote, create)
+        changed = True
     if not laid_out:
-        write(lambda: gh.set_default_branch(target, "about"), ref="about")
-    # Only after the default branch is `about`, and only originals that have not moved since
-    # the listing and whose copy is verified on the remote; a re-run handles the rest.
-    now_heads = _heads(Git.ls_remote(remote)) if moves else {}
-    for b in moves:
-        if now_heads.get(b) == heads[b] == now_heads.get(upstream[b]):
-            write(lambda b=b: gh.delete_ref(target, f"heads/{b}"), ref=b)
-        else:
-            log("delete-skipped", target=target, branch=b)
+        retry_rate_limited(
+            lambda: gh.set_default_branch(target, "about"), sleep=sleep, log=log, target=target, ref="about"
+        )
+        changed = True
+    # Only after the default branch is `about`, and only if each original and its copy are
+    # still where the listing saw them; else nothing is deleted and the push raises.
+    if moves:
+        delete = {f"refs/heads/{b}": (heads[b], None) for b in moves}
+        verify = {f"refs/heads/{upstream[b]}": (heads[b], heads[b]) for b in moves}
+        objects.push_leased(remote, delete | verify)
+        changed = True
     return f"ok: {counts}" + (f", {mismatches} mismatch" if mismatches else ""), changed
 
 

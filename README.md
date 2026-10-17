@@ -76,8 +76,12 @@ after a failure finishes the job.
 4. `wsbench layout`: gives each bench repo the branch layout: an orphan `about` branch
    (the default; `bench.yaml` and a README generated from it), `upstream/<branch>` for
    every original branch, and `tapeout/<org>/<run>/<slot>` for every tapeout tag.
-   Original branches are deleted only after every new branch is verified and `about` is
-   the default branch.
+   Branches are written with git, from the repo's local bare clone under `work/mirrors/`
+   (seeded from a local mirror of upstream when one exists, then fetched from the bench
+   repo): one atomic push creates the new branches, the default branch is switched to
+   `about` through the API, and one more atomic push deletes the original branches. That
+   push uses `--force-with-lease`: if an original or its `upstream/` copy moved since the
+   listing, nothing is deleted and the repo reports an error; a re-run finishes it.
 
 The other three run unattended in GitHub Actions (see Automation), and can be run by hand:
 
@@ -140,10 +144,15 @@ Copy [`bench.local.toml.example`](bench.local.toml.example) to `bench.local.toml
 (git-ignored) and adjust it:
 
 - `work_dir`: where local clones live (`work_dir/mirrors/<bench name>.git` for copies,
-  `work_dir/about/` for the small repos that build `about` commits).
+  and for every repo `layout` lays out; `work_dir/about/` for the small repos that build
+  `about` commits). Laying out all repos needs about 10.5 GB of clones there. `layout`
+  fetches the bench repo's refs into `refs/bench/` of the clone, so `copy`'s own branches
+  and tags in it are untouched.
 - `[mirrors]`: a public URL prefix mapped to a local directory of bare mirrors with the
   same layout. A clone uses `<dir>/<rest of URL>[.git]` when it exists (matching the case
-  exactly or, failing that, ignoring case), else the public URL.
+  exactly or, failing that, ignoring case), else the public URL. Mirrors are read-only to
+  the tooling: they are only cloned from, with `--no-hardlinks`, and no git command runs
+  inside one.
 
 Without a mirror, a deleted repo can be restored only if `data/restore_sources.toml`
 names a public source for it; otherwise `copy` reports `no source`. Local paths never
