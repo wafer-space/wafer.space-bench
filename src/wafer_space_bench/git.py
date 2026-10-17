@@ -146,9 +146,33 @@ class Git:
         """An annotated tag `name` on commit `target`."""
         self._git("tag", "-a", name, "-m", message, target)
 
-    def fetch(self, remote: str, refspecs: list[str], *, prune: bool = False, no_tags: bool = False) -> None:
+    @staticmethod
+    def ls_remote(url: str) -> dict[str, str]:
+        """{ref: sha} of the heads and tags at `url`, downloading no objects. Annotated
+        tags map to the commit they peel to."""
+        out = _run(["ls-remote", "--heads", "--tags", url])
+        refs: dict[str, str] = {}
+        peeled: dict[str, str] = {}
+        for line in out.splitlines():
+            sha, _, ref = line.partition("\t")
+            if ref.endswith("^{}"):
+                peeled[ref.removesuffix("^{}")] = sha
+            elif ref:
+                refs[ref] = sha
+        return {**refs, **{r: s for r, s in peeled.items() if r in refs}}
+
+    def fetch(
+        self,
+        remote: str,
+        refspecs: list[str],
+        *,
+        prune: bool = False,
+        no_tags: bool = False,
+        depth: int | None = None,
+    ) -> None:
         opts = ["--prune"] if prune else []
         opts += ["--no-tags"] if no_tags else []
+        opts += [f"--depth={depth}"] if depth else []
         self._git("fetch", "--quiet", *opts, remote, *refspecs)
 
     def push(self, remote: str, refspecs: list[str]) -> None:

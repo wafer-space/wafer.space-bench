@@ -136,3 +136,37 @@ def test_show_reads_blob_or_none(tmp_path):
     assert g.show("refs/heads/x", "a.txt") == "hello\n"
     assert g.show("refs/heads/x", "missing") is None
     assert g.show("refs/heads/nope", "a.txt") is None
+
+
+def test_ls_remote_heads_and_peeled_tags(tmp_path, upstream, remote):
+    path, shas = upstream
+    subprocess.run(["git", "tag", "light", shas["main"]], cwd=path, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=T", "-c", "user.email=t@e", "tag", "-a", "ann", "-m", "m", shas["ttgf0p2"]],
+        cwd=path,
+        check=True,
+    )
+    subprocess.run(["git", "push", "-q", remote, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"],
+                   cwd=path, check=True)  # fmt: skip
+    refs = Git.ls_remote(remote)
+    assert refs == {
+        "refs/heads/main": shas["main"],
+        "refs/heads/feature/x": shas["feature/x"],
+        "refs/heads/ttgf0p2": shas["ttgf0p2"],
+        "refs/tags/light": shas["main"],
+        "refs/tags/ann": shas["ttgf0p2"],  # annotated: the peeled commit
+    }
+
+
+def test_ls_remote_empty_and_missing(tmp_path, remote):
+    assert Git.ls_remote(remote) == {}
+    with pytest.raises(GitError):
+        Git.ls_remote((tmp_path / "nope.git").as_uri())
+
+
+def test_fetch_depth(tmp_path, upstream):
+    path, shas = upstream
+    g = Git.init_bare(tmp_path / "s.git")
+    g.fetch(path.as_uri(), ["+refs/heads/ttgf0p2:refs/heads/x"], depth=1, no_tags=True)
+    assert g.rev_parse("refs/heads/x") == shas["ttgf0p2"]
+    assert g.rev_parse("refs/heads/x~1") is None  # shallow: the parent was not fetched
