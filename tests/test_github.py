@@ -40,7 +40,7 @@ def fail(err):
 
 def test_ghcli_fork_args():
     stub = Stub(ok({"full_name": "o/a--b"}))
-    GhCli(runner=stub).fork("a/b", "o", "a--b")
+    assert GhCli(runner=stub).fork("a/b", "o", "a--b") == "o/a--b"
     assert stub.cmds == [
         [
             "gh",
@@ -123,11 +123,47 @@ def test_ghcli_branches_visible():
 
 
 def test_ghcli_get_tag():
-    stub = Stub(ok({"object": {"sha": B, "type": "tag"}}), fail("gh: Not Found (HTTP 404)"))
+    stub = Stub(ok({"object": {"sha": A, "type": "commit"}}), fail("gh: Not Found (HTTP 404)"))
     gh = GhCli(runner=stub)
-    assert gh.get_tag("o/x", "tapeout/ws-run1/d") == B
+    assert gh.get_tag("o/x", "tapeout/ws-run1/d") == A
     assert stub.cmds[0][-1] == "repos/o/x/git/ref/tags/tapeout/ws-run1/d"
     assert gh.get_tag("o/x", "tapeout/ws-run1/d") is None
+
+
+def test_ghcli_get_tag_annotated_returns_commit():
+    stub = Stub(ok({"object": {"sha": B, "type": "tag"}}), ok({"object": {"sha": A, "type": "commit"}}))
+    assert GhCli(runner=stub).get_tag("o/x", "tapeout/r/d") == A
+    assert stub.cmds[1][-1] == f"repos/o/x/git/tags/{B}"
+
+
+def test_ghcli_empty_repo_409_is_none():
+    empty = fail("gh: Git Repository is empty. (HTTP 409)")
+    gh = GhCli(runner=Stub(empty, empty))
+    assert gh.resolve_commit("o/new", "aaaa") is None
+    assert gh.get_tag("o/new", "tapeout/r/d") is None
+
+
+ODD = "upstream/fix#12%x"
+ODD_Q = "upstream/fix%2312%25x"
+
+
+def test_ghcli_refs_and_paths_are_url_encoded():
+    stub = Stub(ok({}), ok(""), fail("gh: Not Found (HTTP 404)"), fail("gh: Not Found (HTTP 404)"))
+    gh = GhCli(runner=stub)
+    gh.set_ref("o/x", f"heads/{ODD}", A)
+    gh.delete_ref("o/x", f"heads/{ODD}")
+    gh.get_tag("o/x", ODD)
+    gh.get_file("o/x", "dir/a#b%c.txt", ODD)
+    assert stub.cmds[0][4] == f"repos/o/x/git/refs/heads/{ODD_Q}"
+    assert stub.cmds[1][4] == f"repos/o/x/git/refs/heads/{ODD_Q}"
+    assert stub.cmds[2][4] == f"repos/o/x/git/ref/tags/{ODD_Q}"
+    assert stub.cmds[3][4] == f"repos/o/x/contents/dir/a%23b%25c.txt?ref={ODD_Q}"
+
+
+def test_ghcli_set_ref_create_fallback_keeps_raw_ref_in_body():
+    stub = Stub(fail("gh: Reference does not exist (HTTP 422)"), ok({}))
+    GhCli(runner=stub).set_ref("o/x", f"heads/{ODD}", A)
+    assert stub.cmds[1][4:] == ["repos/o/x/git/refs", "-f", f"ref=refs/heads/{ODD}", "-f", f"sha={A}"]
 
 
 def test_ghcli_create_tag_makes_object_then_ref():
@@ -284,9 +320,26 @@ def test_fake_implements_protocol():
 def test_fake_one_fork_per_network(gh):
     gh.add_upstream("root/x", commits=[A], branches={"main": A})
     gh.add_upstream("someone/x", network="root/x")
-    gh.fork("root/x", "o", "root--x")
-    with pytest.raises(GitHubError, match="already forked in network"):
-        gh.fork("someone/x", "o", "someone--x")
+    assert gh.fork("root/x", "o", "root--x") == "o/root--x"
+    before = dict(gh.repos)
+    assert gh.fork("someone/x", "o", "someone--x") == "o/root--x"
+    assert gh.repos == before
+    with pytest.raises(NotFound):
+        gh.get_repo("o/someone--x")
+    assert [c[0] for c in gh.calls] == ["fork", "fork"]
+
+
+def test_fake_fork_name_collision_gets_suffix(gh):
+    gh.add_upstream("root/x", branches={"main": A})
+    gh.create_repo("o", "root--x", "unrelated")
+    assert gh.fork("root/x", "o", "root--x") == "o/root--x-1"
+    assert gh.get_repo("o/root--x-1").network == "root/x"
+
+
+def test_fake_deleted_repo_does_not_block_fork(gh):
+    gh.add_upstream("root/x", branches={"main": A})
+    gh.add_upstream("o/old-copy", network="root/x", deleted=True)
+    assert gh.fork("root/x", "o", "root--x") == "o/root--x"
 
 
 def test_fake_fork_copies_branches_and_network(gh):

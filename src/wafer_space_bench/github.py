@@ -39,9 +39,20 @@ class RepoInfo:
 class GitHub(Protocol):
     def get_repo(self, full_name: str) -> RepoInfo: ...
     def resolve_commit(self, full_name: str, sha: str) -> str | None: ...
-    def fork(self, source_full_name: str, org: str, name: str) -> None: ...
+    def fork(self, source_full_name: str, org: str, name: str) -> str:
+        """Fork into `org` as `name`; returns the resulting repo's full_name.
+
+        Like GitHub, if `org` already has a repo in the source's fork network this
+        returns that existing repo and creates nothing, and a name taken by an unrelated
+        repo gets a suffix (`name-1`). Callers must compare the result with the request.
+        """
+        ...
+
     def branches_visible(self, full_name: str) -> bool: ...
-    def get_tag(self, full_name: str, tag: str) -> str | None: ...
+    def get_tag(self, full_name: str, tag: str) -> str | None:
+        """The commit SHA the tag points at (annotated tags are peeled); None if absent."""
+        ...
+
     def create_tag(self, full_name: str, tag: str, sha: str, message: str) -> None: ...
     def create_repo(self, org: str, name: str, description: str) -> None: ...
     def set_default_branch(self, full_name: str, branch: str) -> None: ...
@@ -51,6 +62,11 @@ class GitHub(Protocol):
     def delete_ref(self, full_name: str, ref: str) -> None: ...
     def get_file(self, full_name: str, path: str, ref: str) -> str | None: ...
     def dispatch(self, full_name: str, event_type: str) -> None: ...
+
+
+def _q(s: str) -> str:
+    """URL-quote a ref or path for the URL path (keeps `/`, escapes `#`, `%`, `?`)."""
+    return quote(s, safe="/")
 
 
 def _classify(cmd: list[str], stderr: str) -> GitHubError:
@@ -109,25 +125,32 @@ class GhCli:
         except NotFound:
             return None
         except GitHubError as e:
-            if "HTTP 422" in str(e):
+            if "HTTP 422" in str(e) or "HTTP 409" in str(e):  # 409: empty repository
                 return None
             raise
 
-    def fork(self, source_full_name: str, org: str, name: str) -> None:
-        self._api(
+    def fork(self, source_full_name: str, org: str, name: str) -> str:
+        return self._api(
             f"repos/{source_full_name}/forks",
             "POST",
             {"organization": org, "name": name, "default_branch_only": False},
-        )
+        )["full_name"]
 
     def branches_visible(self, full_name: str) -> bool:
         return bool(self._api(f"repos/{full_name}/branches?per_page=1"))
 
     def get_tag(self, full_name: str, tag: str) -> str | None:
         try:
-            return self._api(f"repos/{full_name}/git/ref/tags/{tag}")["object"]["sha"]
+            obj = self._api(f"repos/{full_name}/git/ref/tags/{_q(tag)}")["object"]
         except NotFound:
             return None
+        except GitHubError as e:
+            if "HTTP 409" in str(e):  # empty repository
+                return None
+            raise
+        if obj["type"] == "tag":  # annotated: peel the tag object to its commit
+            obj = self._api(f"repos/{full_name}/git/tags/{obj['sha']}")["object"]
+        return obj["sha"]
 
     def create_tag(self, full_name: str, tag: str, sha: str, message: str) -> None:
         obj = self._api(
@@ -155,18 +178,18 @@ class GhCli:
 
     def set_ref(self, full_name: str, ref: str, sha: str) -> None:
         try:
-            self._api(f"repos/{full_name}/git/refs/{ref}", "PATCH", {"sha": sha, "force": True})
+            self._api(f"repos/{full_name}/git/refs/{_q(ref)}", "PATCH", {"sha": sha, "force": True})
         except GitHubError as e:
             if "Reference does not exist" not in str(e):
                 raise
             self._api(f"repos/{full_name}/git/refs", "POST", {"ref": f"refs/{ref}", "sha": sha})
 
     def delete_ref(self, full_name: str, ref: str) -> None:
-        self._api(f"repos/{full_name}/git/refs/{ref}", "DELETE")
+        self._api(f"repos/{full_name}/git/refs/{_q(ref)}", "DELETE")
 
     def get_file(self, full_name: str, path: str, ref: str) -> str | None:
         try:
-            r = self._api(f"repos/{full_name}/contents/{path}?ref={quote(ref, safe='/')}")
+            r = self._api(f"repos/{full_name}/contents/{_q(path)}?ref={_q(ref)}")
         except NotFound:
             return None
         return base64.b64decode(r["content"]).decode()

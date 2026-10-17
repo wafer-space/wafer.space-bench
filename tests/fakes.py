@@ -3,7 +3,8 @@
 Models what the tooling relies on:
 - Networks: every repo belongs to one network (named by its root repo), and each network
   has a set of commits. Any repo can reference any commit in its network, and only those.
-- One repo per network per org: a second fork into the same org raises.
+- One repo per network per org: a second fork into the same org returns the existing
+  fork; a name taken by an unrelated repo gets a `-1` suffix.
 - Renames: the old name keeps working and `get_repo` reports the new name.
 - Deleted repos raise `NotFound`.
 - Rate limits on creations (`rate_limit_next`) and slow fork readiness (`ready_after`).
@@ -115,18 +116,21 @@ class FakeGitHub:
         hits = [c for c in self.networks[self.repos[name].network] if c.startswith(sha.lower())]
         return hits[0] if len(hits) == 1 else None
 
-    def fork(self, source_full_name: str, org: str, name: str) -> None:
+    def fork(self, source_full_name: str, org: str, name: str) -> str:
         self._record("fork", source_full_name, org, name)
         src = self._resolve(source_full_name)
         self._creation()
         net = self.repos[src].network
-        if any(r.network == net and n.split("/")[0].lower() == org.lower() for n, r in self.repos.items()):
-            raise GitHubError(f"repos/{src}/forks: already forked in network (HTTP 422)")
-        full = f"{org}/{name}"
-        if full.lower() in self._names:
-            raise GitHubError(f"repos/{src}/forks: name already exists on this account (HTTP 422)")
+        for n, r in self.repos.items():  # GitHub returns the org's existing fork in the network
+            if r.network == net and n.split("/")[0].lower() == org.lower() and n not in self._deleted:
+                return n
+        full, i = f"{org}/{name}", 0
+        while full.lower() in self._names:  # name taken by an unrelated repo: GitHub adds -1, -2, ...
+            i += 1
+            full = f"{org}/{name}-{i}"
         self._put(full, net, fork=True, default=self.repos[src].default_branch, branches=self.branches[src])
         self._not_ready[full] = self._ready_after
+        return full
 
     def branches_visible(self, full_name: str) -> bool:
         name = self._resolve(full_name)
