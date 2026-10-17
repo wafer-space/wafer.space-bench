@@ -50,7 +50,7 @@
 **Interfaces:**
 - Produces: `wafer_space_bench.cli.main(argv: list[str] | None = None) -> int`; console script `wsbench`. Each later task adds a subcommand via `add_subcommand(subparsers)` in its module, registered in `cli.py`.
 
-Working copy: `~/github/wafer-space/wafer.space-bench` (`git init`). The GitHub repo is created in Task 11.
+Work in a local clone of this repo. The GitHub repo is created at cutover.
 
 - [ ] **Step 1: Write `pyproject.toml`**
   - `name = "wafer-space-bench"`, `requires-python = ">=3.11"`.
@@ -333,7 +333,7 @@ def test_real_catalog_has_unique_tags():
   - `test_copy_description_public`: no banned string, and the text names the strategy reason.
   - `test_copy_none_reports_no_source`.
 - [ ] **Step 2: Run.** Expected: FAIL.
-- [ ] **Step 3: Implement.** Port from `experiments/tools/bench_copy.py`, replacing hard-coded `/backups` paths with `LocalConfig.mirrors` and `data/restore_sources.toml`. Create repos via `gh.create_repo`, with the same `RateLimited` backoff as Task 6: extract `retry_rate_limited(fn, sleep, log, base_wait, max_wait)` into `fork.py` and reuse it.
+- [ ] **Step 3: Implement.** Port from `experiments/tools/bench_copy.py`, replacing hard-coded local mirror paths with `LocalConfig.mirrors` and `data/restore_sources.toml`. Create repos via `gh.create_repo`, with the same `RateLimited` backoff as Task 6: extract `retry_rate_limited(fn, sleep, log, base_wait, max_wait)` into `fork.py` and reuse it.
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** "Add copy/restore of repos that cannot be forks".
 
