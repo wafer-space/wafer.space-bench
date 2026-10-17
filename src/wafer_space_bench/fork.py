@@ -155,7 +155,8 @@ def run_fork(
     return failed
 
 
-def _matches(p: RepoPlan, only: set[str]) -> bool:
+def plan_matches(p: RepoPlan, only: set[str]) -> bool:
+    """True if `p` is named in `only` (lowercased bench, current or source full name)."""
     names = {p.target.split("/", 1)[1].lower(), p.current_name.lower(), p.source.key}
     return bool(names & only)
 
@@ -164,7 +165,7 @@ def _fork(args) -> int:
     plans = read_plans(args.plans)
     if args.only:
         only = {o.lower() for o in args.only}
-        plans = [p for p in plans if _matches(p, only)]
+        plans = [p for p in plans if plan_matches(p, only)]
     tapeouts = tapeouts_by_repo(load_designs(args.catalog))
     log = EventLog(args.log).write
     failed = run_fork(plans, tapeouts, GhCli(), args.org, delay=args.delay, log=log)
