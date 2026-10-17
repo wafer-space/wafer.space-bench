@@ -175,5 +175,6 @@ class Git:
         opts += [f"--depth={depth}"] if depth else []
         self._git("fetch", "--quiet", *opts, remote, *refspecs)
 
-    def push(self, remote: str, refspecs: list[str]) -> None:
-        self._git("push", "--quiet", remote, *refspecs)
+    def push(self, remote: str, refspecs: list[str], *, atomic: bool = False) -> None:
+        """Push `refspecs`; `atomic` updates either every ref or none."""
+        self._git("push", "--quiet", *(["--atomic"] if atomic else []), remote, *refspecs)

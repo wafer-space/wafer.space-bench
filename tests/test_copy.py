@@ -3,7 +3,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from fakes import FakeGitHub
+from fakes import FakeGitHub, sh
 from test_privacy import BANNED
 
 from wafer_space_bench.catalog import Tapeout
@@ -276,10 +276,10 @@ def test_run_copies_paces_repo_creations(tmp_path, upstream, remote):
     gh, sleeps = FakeGitHub(), Sleeps()
     plans = [copy_plan(), copy_plan("gone", "repo", strategy="restore")]
     kw = {"log": Events(), "sources": {}, "sleep": sleeps}
-    assert run_copies(plans, {}, gh, cfg_for(tmp_path), ORG, remote, **kw) == 0
+    assert run_copies(plans, {}, gh, cfg_for(tmp_path), ORG, remote, **kw) == 1  # gone/repo: no source
     assert sleeps == [20]  # after the one created repo only
     sleeps.clear()
-    assert run_copies(plans, {}, gh, cfg_for(tmp_path), ORG, remote, delay=5, **kw) == 0
+    assert run_copies(plans, {}, gh, cfg_for(tmp_path), ORG, remote, delay=5, **kw) == 1
     assert sleeps == []  # nothing created
 
 
@@ -360,3 +360,81 @@ def test_local_tapeout_tag_survives_upstream_same_name(tmp_path, upstream, remot
     assert local.rev_parse(f"refs/tags/{TAG}") == shas["ttgf0p2"]
     assert local.rev_parse("refs/tags/v2") == shas["main"]  # ordinary upstream tags still come
     assert Git(tmp_path / "remote.git").rev_parse(f"refs/tags/{TAG}") == shas["ttgf0p2"]
+
+
+# --- final review: re-runs, exit code, atomic push, mirror case -----------------
+
+TAG2 = "google/gf180mcu-mpw0/slot_1"
+
+
+def tag_object(path, tag):
+    return subprocess.run(["git", "rev-parse", f"refs/tags/{tag}"], cwd=path, check=True, capture_output=True,
+                          text=True).stdout.strip()  # fmt: skip
+
+
+def test_copy_rerun_from_deleted_work_dir(tmp_path, upstream, remote, monkeypatch):
+    """The fresh clone lacks our tapeout tags: they are fetched from the bench repo, not remade."""
+    import shutil
+
+    _, shas = upstream
+    gh, cfg = FakeGitHub(), cfg_for(tmp_path)
+    tos = {"a/upstream": [tapeout(shas["ttgf0p2"])]}
+    assert run_copy(copy_plan(), tos, gh, cfg, ORG, remote, log=Events()) == "created+pushed"
+    before = tag_object(tmp_path / "remote.git", TAG)
+    shutil.rmtree(tmp_path / "work")
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2030-01-01T00:00:00Z")  # a remade tag would differ
+    ev = Events()
+    assert run_copy(copy_plan(), tos, gh, cfg, ORG, remote, log=ev) == "pushed"
+    assert tag_object(tmp_path / "remote.git", TAG) == before
+    local = Git(tmp_path / "work" / "mirrors" / "a--upstream.git")
+    assert tag_object(local.path, TAG) == before
+
+
+def test_copy_after_tapeout_tag_made_through_the_api(tmp_path, upstream, remote, monkeypatch):
+    """sync creates tapeout tags through the API; copy's existing clone has never seen them."""
+    _, shas = upstream
+    gh, cfg = FakeGitHub(), cfg_for(tmp_path)
+    run_copy(copy_plan(), {"a/upstream": [tapeout(shas["ttgf0p2"])]}, gh, cfg, ORG, remote, log=Events())
+    subprocess.run(["git", "tag", "-a", TAG2, "-m", "made by the API", shas["main"]],
+                   cwd=tmp_path / "remote.git", check=True, capture_output=True)  # fmt: skip
+    before = tag_object(tmp_path / "remote.git", TAG2)
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2030-01-01T00:00:00Z")
+    t2 = Tapeout(
+        "google", "gf180mcu-mpw0", "slot_1", "P", "1x1", "digital", "", shas["main"], "", "a/upstream"
+    )
+    tos = {"a/upstream": [tapeout(shas["ttgf0p2"]), t2]}
+    assert run_copy(copy_plan(), tos, gh, cfg, ORG, remote, log=Events()) == "pushed"
+    assert tag_object(tmp_path / "remote.git", TAG2) == before
+
+
+def test_run_copies_counts_no_source_as_failure(tmp_path, remote):
+    gh = FakeGitHub()
+    plans = [copy_plan("gone", "repo", strategy="restore")]
+    assert run_copies(plans, {}, gh, LocalConfig(tmp_path / "work", {}), ORG, remote, log=Events(),
+                      sources={}) == 1  # fmt: skip
+
+
+def test_copy_pushes_heads_atomically(tmp_path, upstream, remote):
+    """A rejected (non-fast-forward) branch means no branch at all is updated."""
+    path, shas = upstream
+    gh, cfg = FakeGitHub(), cfg_for(tmp_path)
+    run_copy(copy_plan(), {}, gh, cfg, ORG, remote, log=Events())
+    sh(path, "commit", "-q", "--amend", "-m", "rewritten")
+    subprocess.run(["git", "branch", "new", "feature/x"], cwd=path, check=True)
+    status = run_copy(copy_plan(), {}, gh, cfg, ORG, remote, log=Events())
+    assert status.startswith("error: ")
+    heads, _ = remote_refs(tmp_path)
+    assert "new" not in heads
+    assert Git(tmp_path / "remote.git").rev_parse("refs/heads/main") == shas["main"]
+
+
+def test_resolve_clone_url_case_insensitive_mirror(tmp_path):
+    (tmp_path / "gh" / "Owner" / "Repo.git").mkdir(parents=True)
+    cfg = LocalConfig(tmp_path, {"https://github.com/": tmp_path / "gh"})
+    assert resolve_clone_url("https://github.com/owner/repo", cfg) == str(
+        tmp_path / "gh" / "Owner" / "Repo.git"
+    )
+    assert resolve_clone_url("https://github.com/OWNER/REPO.git", cfg) == str(
+        tmp_path / "gh" / "Owner" / "Repo.git"
+    )
+    assert resolve_clone_url("https://github.com/owner/other", cfg) == "https://github.com/owner/other"

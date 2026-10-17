@@ -103,6 +103,13 @@ def _clone_or_fetch(url: str, dest: Path, target: str, log: Log) -> Git:
     return git
 
 
+def fetch_tapeout_tags(git: Git, remote: str) -> None:
+    """Fetch the bench repo's tapeout tags into the local clone, never forced: tags made
+    elsewhere (another clone, or sync through the API) are reused, not made again. A local
+    tag that differs from the bench repo's is refused and raises GitError."""
+    git.fetch(remote, [f"refs/tags/{o}/*:refs/tags/{o}/*" for o in TAPEOUT_NAMESPACES], no_tags=True)
+
+
 def _tag_tapeouts(git: Git, plan: RepoPlan, tapeouts: list[Tapeout], why: str, log: Log) -> None:
     existing = set(git.tags())
     for t in tapeouts:
@@ -155,20 +162,25 @@ def run_copy(
             if plan.strategy == "restore":
                 return done("no source")
             raise
-        _tag_tapeouts(git, plan, tapeouts.get(plan.source.key, []), why, log)
+        remote = remote_fmt.format(full=plan.target)
         try:
             laid_out = gh.get_repo(plan.target).default_branch == "about"
-            created = False
-        except NotFound:
+            exists = True
+        except NotFound:  # first run: nothing to fetch from yet
+            laid_out = exists = False
+        if exists:
+            fetch_tapeout_tags(git, remote)
+        _tag_tapeouts(git, plan, tapeouts.get(plan.source.key, []), why, log)
+        created = False
+        if not exists:
             name = plan.target.split("/", 1)[1]
             description = copy_description(plan)
             retry_rate_limited(
                 lambda: gh.create_repo(org, name, description), sleep=sleep, log=log, target=plan.target
             )
-            laid_out, created = False, True
-        remote = remote_fmt.format(full=plan.target)
+            created = True
         if not laid_out:  # once laid out, the original branches live under upstream/*
-            git.push(remote, ["refs/heads/*:refs/heads/*"])
+            git.push(remote, ["refs/heads/*:refs/heads/*"], atomic=True)
         push_tags(git, remote)
         if laid_out:
             return done("exists (laid out)")
@@ -192,7 +204,7 @@ def run_copies(
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """run_copy every copy/restore plan, sleeping `delay` after each created repo.
-    Returns the number of plans that ended in an error."""
+    Returns the number of plans that ended in an error or with no source to copy from."""
     todo = [p for p in plans if p.strategy in STRATEGIES]
     failed = 0
     for i, p in enumerate(todo, 1):
@@ -200,7 +212,7 @@ def run_copies(
             p, tapeouts, gh, cfg, org, remote_fmt, log=log, sources=sources, dry_run=dry_run, sleep=sleep
         )
         print(f"{i}/{len(todo)} {p.target}: {status}", flush=True)
-        failed += status.startswith("error:")
+        failed += status.startswith("error:") or status == "no source"
         if status == "created+pushed":
             sleep(delay)
     return failed
