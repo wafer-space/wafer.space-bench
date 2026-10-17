@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # Pinned action SHAs (with their # vX.Y.Z comments) in .github/workflows and in the
+  # index repo's workflow source, index-repo/.github/workflows.
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/index-repo"
+    schedule:
+      interval: weekly
