@@ -16,13 +16,14 @@ logged), tags are only ever created, and `dev/*` and other branches are never to
 A second run with nothing new upstream makes no writes.
 """
 
+import argparse
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from wafer_space_bench.catalog import Tapeout, load_designs, tapeouts_by_repo
 from wafer_space_bench.config import LocalConfig, load_config, resolve_clone_url
-from wafer_space_bench.copy import local_clone_path
+from wafer_space_bench.copy import copy_why, local_clone_path
 from wafer_space_bench.events import EventLog
 from wafer_space_bench.fork import Log, ensure_tags, plan_matches, retry_rate_limited
 from wafer_space_bench.git import Git, GitError
@@ -163,7 +164,11 @@ def _sync(
     tos = tapeouts.get(plan.source.key, [])
     created = 0
     if tos:
-        statuses = ensure_tags(gh, target, tos, _upstream_url(plan), log, sleep=sleep)
+        if plan.strategy == "fork":  # the same message as `wsbench fork` gives
+            source, why = _upstream_url(plan), None
+        else:  # the same message as `wsbench copy` gives (copy.py)
+            source, why = plan.source.url, copy_why(plan)
+        statuses = ensure_tags(gh, target, tos, source, log, sleep=sleep, why=why)
         created = sum(s == "created" for s in statuses.values())
         wrote = wrote or created > 0
         for t in tos:
@@ -244,15 +249,21 @@ def run_sync(
     index_repo: str = INDEX_REPO,
     delay: float = 2,
     sleep: Callable[[float], None] = time.sleep,
+    shard: tuple[int, int] | None = None,
 ) -> int:
     """sync_repo every fork/copy/restore plan (only those `only` names, if given), logging one
     `sync` event each and sleeping `delay` after each repo that wrote. If any repo changed
     (and this is not a dry run), dispatch `bench-updated` to `index_repo` once at the end.
+    `shard` (K, N) keeps only the plans at 0-based positions i with i % N == K - 1 in the
+    sorted, `only`-filtered list, so shards 1..N partition the plans.
     Returns the number of repos that ended in an error or a layout conflict."""
-    todo = [p for p in plans if p.strategy in STRATEGIES]
+    todo = sorted((p for p in plans if p.strategy in STRATEGIES), key=lambda p: (p.source.key, p.target))
     if only:
         names = {o.lower() for o in only}
         todo = [p for p in todo if plan_matches(p, names)]
+    if shard is not None:
+        k, n = _check_shard(*shard)
+        todo = [p for i, p in enumerate(todo) if i % n == k - 1]
     outside = [p.target for p in todo if p.target.split("/", 1)[0].lower() != org.lower()]
     if outside:  # checked before any repo is touched
         raise ValueError(f"not in {org}: {', '.join(outside)}")
@@ -273,6 +284,8 @@ def run_sync(
             )
         except (GitError, GitHubError) as e:  # sync_repo returns these; belt and braces
             status = f"error: {e}"
+        except Exception as e:  # noqa: BLE001 -- a bug hit by one repo must not stop the others
+            status = f"error: {type(e).__name__}: {e}"
         log("sync", n=f"{i}/{len(todo)}", target=p.target, status=status)
         ok = status == "laid-out" or status.startswith("ok:")
         changed = changed or ok
@@ -293,6 +306,23 @@ def run_sync(
     return failed
 
 
+def _check_shard(k: int, n: int) -> tuple[int, int]:
+    if not 1 <= k <= n:
+        raise ValueError(f"shard {k}/{n}: need 1 <= K <= N")
+    return k, n
+
+
+def parse_shard(text: str) -> tuple[int, int]:
+    """'K/N' (1-based K) -> (K, N); argparse type for --shard."""
+    k, sep, n = text.partition("/")
+    try:
+        if not sep:
+            raise ValueError(text)
+        return _check_shard(int(k), int(n))
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"--shard wants K/N with 1 <= K <= N, not {text!r}") from e
+
+
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -310,6 +340,7 @@ def _sync_cmd(args) -> int:
         now=_now(),
         log=EventLog(args.log).write,
         delay=args.delay,
+        shard=args.shard,
     )
     return 1 if failed else 0
 
@@ -321,4 +352,10 @@ def add_subcommand(subparsers) -> None:
     )
     p.add_argument("--dry-run", action="store_true", help="only log what would change; no writes")
     p.add_argument("--delay", type=float, default=2, help="seconds to wait after each repo that wrote")
+    p.add_argument(
+        "--shard",
+        type=parse_shard,
+        metavar="K/N",
+        help="only the K-th of N interleaved slices of the plans (1-based K)",
+    )
     p.set_defaults(handler=_sync_cmd)

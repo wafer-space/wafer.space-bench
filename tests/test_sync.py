@@ -7,22 +7,25 @@ the objects GitHub shares across a fork network. A copy's upstream is the real `
 fixture, reached through a `mirrors` prefix in the local config.
 """
 
+import argparse
 import json
 from pathlib import Path
 
+import pytest
 import yaml
-from fakes import SyncedFake, sh
+from fakes import FakeGitHub, SyncedFake, sh
 
 from wafer_space_bench.catalog import Tapeout
 from wafer_space_bench.cli import main
 from wafer_space_bench.config import LocalConfig
-from wafer_space_bench.copy import run_copy
+from wafer_space_bench.copy import copy_why, run_copy
+from wafer_space_bench.fork import tag_message
 from wafer_space_bench.git import Git
 from wafer_space_bench.github import GitHubError
 from wafer_space_bench.layout import apply_layout
 from wafer_space_bench.naming import RepoRef
 from wafer_space_bench.scan import RepoPlan, write_plans
-from wafer_space_bench.sync import MirrorPlan, plan_mirror, run_sync, sync_repo
+from wafer_space_bench.sync import MirrorPlan, parse_shard, plan_mirror, run_sync, sync_repo
 
 ORG = "wafer-space-bench"
 UP = "a/upstream"
@@ -342,7 +345,7 @@ def test_sync_rename_to_nested_branch(tmp_path, upstream, remote):
 # --- sync_repo: copies -----------------------------------------------------------
 
 
-def bench_copy(tmp_path, upstream, path, host="github.com"):
+def bench_copy(tmp_path, upstream, path, host="github.com", extra=()):
     """A laid-out copy bench repo at bare `path`, made by `run_copy` from the upstream fixture."""
     upath, shas = upstream
     sh(upath, "tag", "-a", TAG, "-m", "taped out", shas["ttgf0p2"])
@@ -353,7 +356,7 @@ def bench_copy(tmp_path, upstream, path, host="github.com"):
     gh.link(TARGET, path)
     p = mkplan(strategy="copy", host=host, network="x/root")
     conf = cfg(tmp_path, mirrors={f"https://{host}/a/": tmp_path})
-    tos = {UP: [tapeout(TAG, shas["ttgf0p2"])]}
+    tos = {UP: [tapeout(TAG, shas["ttgf0p2"]), *extra]}
     assert run_copy(p, tos, gh, conf, ORG, path.as_uri(), log=Events()) == "pushed"
     status = apply_layout(
         p, tos, gh, conf, ORG, remote_fmt=path.as_uri(), now=NOW, log=Events(), sleep=Sleeps()
@@ -378,6 +381,40 @@ def test_sync_copy_fetches_and_pushes(tmp_path, upstream, remote):
     assert tags_of(path) == {TAG: shas["ttgf0p2"]}  # upstream tags are not mirrored
     assert [c[0] for c in writes(gh, n)] == []  # objects and refs went by git push
     assert sync(gh, tmp_path, path, shas, plan=p, conf=conf) == "unchanged"
+
+
+def tag_messages(gh, path):
+    """{tag: message} of the tags sync created (fake calls) and of all tags on the remote."""
+    created = {c[1][1]: c[1][3] for c in gh.calls if c[0] == "create_tag"}
+    out = sh(path, "for-each-ref", "--format=%(refname:short)%00%(contents)%01", "refs/tags")
+    remote = dict(r.strip("\n").split("\0", 1) for r in out.split("\1") if r.strip())
+    return created, remote
+
+
+def test_sync_copy_tag_message_matches_copy(tmp_path, upstream, remote):
+    """Tags are permanent: one sync creates for a copy has exactly Task 7's message form."""
+    path = remote_path(remote)
+    shas = upstream[1]
+    t3 = tapeout("wafer.space/ws-run1/slot_9", shas["feature/x"])  # tagged by run_copy (Task 7)
+    gh, p, conf = bench_copy(tmp_path, upstream, path, extra=[t3])
+    t2 = tapeout(TAG2, shas["main"])  # tagged by sync
+    tos = {UP: [tapeout(TAG, shas["ttgf0p2"]), t3, t2]}
+    assert sync(gh, tmp_path, path, shas, plan=p, conf=conf, tos=tos).endswith(", 1 tags")
+    created, on_remote = tag_messages(gh, path)
+    assert list(created) == [TAG2]
+    assert created[TAG2] == tag_message(t2, p.source.url, copy_why(p))
+    assert on_remote[t3.tag].strip() == tag_message(t3, p.source.url, copy_why(p)).strip()
+    assert on_remote[TAG2].strip() == created[TAG2].strip()
+
+
+def test_sync_fork_tag_message_matches_fork(tmp_path, upstream, remote):
+    path = remote_path(remote)
+    gh = bench_fork(tmp_path, upstream, path)
+    shas = upstream[1]
+    t2 = tapeout(TAG2, shas["main"])
+    sync(gh, tmp_path, path, shas, tos={UP: [tapeout(TAG, shas["ttgf0p2"]), t2]})
+    created, _ = tag_messages(gh, path)
+    assert created == {TAG2: tag_message(t2, f"https://github.com/{UP}")}  # as run_fork makes it
 
 
 def test_sync_gitlab_copy(tmp_path, upstream, remote):
@@ -479,6 +516,64 @@ def test_run_sync_only_and_dry_run(tmp_path, upstream):
     assert writes(gh, n) == [] and gh.dispatches == []
 
 
+def pending_plans(k):
+    return [mkplan(f"o/r{i:02d}", f"{ORG}/o--r{i:02d}") for i in range(k)]
+
+
+def synced_targets(plans, gh=None, **kw):
+    ev = Events()
+    failed = run_sync(plans, {}, gh or FakeGitHub(), LocalConfig(), ORG, remote_fmt="unused", now=NOW, log=ev,
+                      sleep=Sleeps(), **kw)  # fmt: skip
+    return failed, [f["target"] for e, f in ev if e == "sync"], ev
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 8])
+def test_run_sync_shards_partition_plans(n):
+    plans = pending_plans(11)
+    every = {p.target for p in plans}
+    shards = [set(synced_targets(list(reversed(plans)), shard=(k, n))[1]) for k in range(1, n + 1)]
+    assert set().union(*shards) == every
+    assert sum(len(s) for s in shards) == len(every)  # pairwise disjoint
+    assert synced_targets(plans, shard=(2, 3))[1] == [f"{ORG}/o--r{i:02d}" for i in (1, 4, 7, 10)]
+
+
+def test_run_sync_shard_after_only():
+    plans = pending_plans(6)
+    only = ["o/r01", "o/r02", "o/r04", "o/r05"]
+    assert synced_targets(plans, only=only, shard=(1, 2))[1] == [f"{ORG}/o--r01", f"{ORG}/o--r04"]
+    assert synced_targets(plans, only=only, shard=(2, 2))[1] == [f"{ORG}/o--r02", f"{ORG}/o--r05"]
+
+
+def test_parse_shard():
+    assert parse_shard("3/8") == (3, 8)
+    assert parse_shard("1/1") == (1, 1)
+    for bad in ("0/8", "9/8", "3", "a/8", "3/b", "-1/8", "1/0", ""):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_shard(bad)
+    with pytest.raises(ValueError):
+        synced_targets(pending_plans(2), shard=(0, 8))
+
+
+def test_cli_sync_rejects_bad_shard(tmp_path):
+    with pytest.raises(SystemExit) as e:
+        main(["--plans", str(tmp_path / "p.csv"), "sync", "--shard", "9/8"])
+    assert e.value.code == 2
+
+
+class Explodes(FakeGitHub):
+    def get_repo(self, full_name):
+        if full_name.endswith("r01"):
+            raise RuntimeError("boom")
+        return super().get_repo(full_name)
+
+
+def test_run_sync_unexpected_exception_continues():
+    failed, targets, ev = synced_targets(pending_plans(3), gh=Explodes())
+    assert failed == 1
+    assert len(targets) == 3
+    assert [f["status"] for e, f in ev if e == "sync"] == ["pending", "error: RuntimeError: boom", "pending"]
+
+
 # --- CLI and workflow ----------------------------------------------------------
 
 
@@ -550,7 +645,12 @@ def test_sync_workflow_shape():
     assert wf["concurrency"] == {"group": "sync", "cancel-in-progress": False}
     assert wf["permissions"] == {"contents": "read"}
     (job,) = wf["jobs"].values()
-    assert job["timeout-minutes"] == 300
+    assert job["timeout-minutes"] == 60
+    assert job["strategy"] == {
+        "fail-fast": False,
+        "max-parallel": 2,
+        "matrix": {"shard": [1, 2, 3, 4, 5, 6, 7, 8]},
+    }
     uses = [s.get("uses", "") for s in job["steps"]]
     assert uses[0] == "actions/create-github-app-token@v2"
     assert job["steps"][0]["with"] == {
@@ -558,13 +658,21 @@ def test_sync_workflow_shape():
         "private-key": "${{ secrets.BENCH_APP_PRIVATE_KEY }}",
         "owner": "wafer-space-bench",
     }
-    cache = next(s for s in job["steps"] if s.get("uses") == "actions/cache@v4")
-    assert cache["with"] == {
+    key = "mirrors-${{ matrix.shard }}-${{ github.run_id }}"
+    restore = next(s for s in job["steps"] if s.get("uses") == "actions/cache/restore@v4")
+    assert restore["with"] == {
         "path": "work/mirrors",
-        "key": "mirrors-${{ github.run_id }}",
-        "restore-keys": "mirrors-",
+        "key": key,
+        "restore-keys": "mirrors-${{ matrix.shard }}-",
     }
+    save = next(s for s in job["steps"] if s.get("uses") == "actions/cache/save@v4")
+    assert save["if"] == "always()" and save["with"] == {"path": "work/mirrors", "key": key}
+    assert "actions/cache@v4" not in uses  # it would skip saving when sync exits 1
     upload = next(s for s in job["steps"] if s.get("uses") == "actions/upload-artifact@v4")
     assert upload["if"] == "always()" and upload["with"]["path"] == "work/events.jsonl"
-    run = next(s["run"] for s in job["steps"] if "wsbench" in s.get("run", ""))
+    assert "${{ matrix.shard }}" in upload["with"]["name"]
+    step = next(s for s in job["steps"] if "wsbench" in s.get("run", ""))
+    run = step["run"]
     assert "--remote-fmt 'https://github.com/{full}.git'" in run and "--log work/events.jsonl" in run
+    assert step["env"]["SHARD"] == "${{ matrix.shard }}" and '--shard "$SHARD/8"' in run
+    assert '"${#names[@]}" -gt 0' in run  # a whitespace-only `only` adds no bare --only

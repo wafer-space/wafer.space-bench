@@ -61,7 +61,8 @@ def restore_sources(path: Path) -> dict[str, RestoreSource]:
     return {k.lower(): RestoreSource(v["public_url"], v["description"]) for k, v in data.items()}
 
 
-def _why(plan: RepoPlan) -> str:
+def copy_why(plan: RepoPlan) -> str:
+    """Why `plan` is a copy, for its description and its tapeout tag messages."""
     if plan.strategy == "restore":
         return "upstream repository was deleted"
     if plan.source.host != "github.com":
@@ -70,7 +71,7 @@ def _why(plan: RepoPlan) -> str:
 
 
 def copy_description(plan: RepoPlan) -> str:
-    return f"Copy of {plan.source.url} for the wafer.space GF180 benchmark ({_why(plan)})"
+    return f"Copy of {plan.source.url} for the wafer.space GF180 benchmark ({copy_why(plan)})"
 
 
 def _public_url(plan: RepoPlan, sources: dict[str, RestoreSource]) -> str:
@@ -143,7 +144,7 @@ def run_copy(
 
     if dry_run:
         return done(f"dry-run: {kind}")
-    why = _why(plan)
+    why = copy_why(plan)
     src = sources.get(plan.source.key) if plan.strategy == "restore" else None
     if src:
         why += f"; copied from {src.description}"

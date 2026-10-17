@@ -3,15 +3,14 @@
 FakeGitHub and the real git remote are kept consistent by `SyncedFake` (tests/fakes.py):
 its `set_ref`, `delete_ref` and `set_default_branch` also apply the change to the bare
 `file://` remote (git update-ref / symbolic-ref), and first copy the remote's heads and
-commits into the fake. `ls-remote` and the `about` push therefore see exactly what the API calls did, and
-the final-state assertions are made on the real remote.
+commits into the fake. `ls-remote` and the `about` push therefore see exactly what the API
+calls did, and the final-state assertions are made on the real remote.
 """
 
 import json
-import subprocess
 
 import yaml
-from fakes import SyncedFake
+from fakes import SyncedFake, sh
 
 from wafer_space_bench.catalog import Tapeout
 from wafer_space_bench.cli import main
@@ -38,16 +37,6 @@ class Events(list):
 class Sleeps(list):
     def __call__(self, s):
         self.append(s)
-
-
-def sh(cwd, *args):
-    return subprocess.run(
-        ["git", "-c", "user.name=T", "-c", "user.email=t@e", *args],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
 
 def plan():

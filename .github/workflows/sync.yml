@@ -1,5 +1,10 @@
 name: Sync
 
+# Sharded (ruling R14): an App installation token lasts 60 minutes, so the plans are split
+# into 8 interleaved shards, each a job that mints its own token and must finish within
+# 60 minutes. Each shard that changed something dispatches `bench-updated` to the index
+# repo; pages.yml's concurrency group serialises the resulting builds.
+
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -24,7 +29,12 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - id: app-token
         uses: actions/create-github-app-token@v2
@@ -42,30 +52,38 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: gh auth setup-git
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         with:
           path: work/mirrors
-          key: mirrors-${{ github.run_id }}
-          restore-keys: mirrors-
+          key: mirrors-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: mirrors-${{ matrix.shard }}-
       - name: Sync
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           # Inputs reach the shell only as environment variables, never as ${{ }} in `run`.
           ONLY: ${{ inputs.only }}
           DRY_RUN: ${{ inputs.dry_run }}
+          SHARD: ${{ matrix.shard }}
         run: |
-          args=()
-          if [ -n "$ONLY" ]; then
-            read -ra names <<< "$ONLY"
+          mkdir -p work/mirrors
+          args=(--shard "$SHARD/8")
+          read -ra names <<< "$ONLY"
+          if [ "${#names[@]}" -gt 0 ]; then
             args+=(--only "${names[@]}")
           fi
           if [ "$DRY_RUN" = "true" ]; then
             args+=(--dry-run)
           fi
           uv run wsbench --remote-fmt 'https://github.com/{full}.git' --log work/events.jsonl sync "${args[@]}"
+      # Saved even when sync exits 1 (some repo failed), so the next run starts warm.
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: work/mirrors
+          key: mirrors-${{ matrix.shard }}-${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sync-events
+          name: sync-events-${{ matrix.shard }}
           path: work/events.jsonl
           if-no-files-found: ignore

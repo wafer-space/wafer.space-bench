@@ -89,7 +89,10 @@ def ensure_tags(
     log: Log,
     *,
     sleep: Callable[[float], None] = time.sleep,
+    why: str | None = None,
 ) -> dict[str, TagStatus]:
+    """Create each missing tapeout tag through the API; `source_url` and `why` go into the
+    tag message (`tag_message`). Existing tags are never changed."""
     out: dict[str, TagStatus] = {}
     for t in tapeouts:
         status: TagStatus
@@ -100,7 +103,7 @@ def ensure_tags(
             if full is None:
                 status = "missing-commit"
             else:
-                message = tag_message(t, source_url)
+                message = tag_message(t, source_url, why)
                 retry_rate_limited(
                     lambda t=t, full=full, message=message: gh.create_tag(repo_full, t.tag, full, message),
                     sleep=sleep,
