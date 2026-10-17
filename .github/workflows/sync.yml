@@ -43,7 +43,7 @@ jobs:
           app-id: ${{ vars.BENCH_APP_ID }}
           private-key: ${{ secrets.BENCH_APP_PRIVATE_KEY }}
           owner: wafer-space-bench
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # git must authenticate with the app token (via gh), not this repo's GITHUB_TOKEN
           persist-credentials: false
