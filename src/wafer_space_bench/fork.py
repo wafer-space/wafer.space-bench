@@ -1,0 +1,157 @@
+"""Fork upstream repos into the bench org and tag their taped-out commits."""
+
+import time
+from collections.abc import Callable
+from typing import Any, Literal
+
+from wafer_space_bench.catalog import Tapeout, load_designs, tapeouts_by_repo
+from wafer_space_bench.events import EventLog
+from wafer_space_bench.github import GhCli, GitHub, GitHubError, NotFound, RateLimited
+from wafer_space_bench.naming import COMMIT_SOURCE
+from wafer_space_bench.scan import RepoPlan, read_plans
+
+Log = Callable[..., None]  # log(event: str, **fields)
+TagStatus = Literal["created", "exists", "missing-commit"]
+
+
+def tag_message(t: Tapeout, source_url: str, why: str | None = None) -> str:
+    suffix = f" ({why})" if why else ""
+    return f"Taped out as {t.tag}\n\nSource: {source_url}{suffix}\nCommit source: {COMMIT_SOURCE[t.org]}\n"
+
+
+def retry_rate_limited(
+    fn: Callable[[], Any],
+    *,
+    sleep: Callable[[float], None],
+    log: Log,
+    base_wait: float = 60,
+    max_wait: float = 960,
+    **context,
+) -> Any:
+    """Call `fn`; on RateLimited log `backoff`, sleep, double the wait (capped), retry."""
+    wait = base_wait
+    while True:
+        try:
+            return fn()
+        except RateLimited:
+            log("backoff", wait_s=wait, **context)
+            sleep(wait)
+            wait = min(wait * 2, max_wait)
+
+
+def _exists(gh: GitHub, full: str) -> bool:
+    try:
+        gh.get_repo(full)
+    except NotFound:
+        return False
+    return True
+
+
+def ensure_fork(
+    gh: GitHub,
+    plan: RepoPlan,
+    org: str,
+    *,
+    sleep: Callable[[float], None],
+    log: Log,
+    base_wait: float = 60,
+    max_wait: float = 960,
+    ready_polls: int = 30,
+) -> Literal["created", "exists"]:
+    target = plan.target
+    if _exists(gh, target):
+        return "exists"
+    name = target.split("/", 1)[1]
+    got = retry_rate_limited(
+        lambda: gh.fork(plan.current_name, org, name),
+        sleep=sleep,
+        log=log,
+        base_wait=base_wait,
+        max_wait=max_wait,
+        source=plan.current_name,
+    )
+    if got.lower() != target.lower():
+        raise GitHubError(f"fork network already has {got}")
+    for i in range(ready_polls):  # forks are created asynchronously
+        if gh.branches_visible(target):
+            return "created"
+        if i < ready_polls - 1:
+            sleep(2)
+    log("fork-not-ready", target=target)
+    return "created"  # a re-run finishes the tags
+
+
+def ensure_tags(
+    gh: GitHub, repo_full: str, tapeouts: list[Tapeout], source_url: str, log: Log
+) -> dict[str, TagStatus]:
+    out: dict[str, TagStatus] = {}
+    for t in tapeouts:
+        status: TagStatus
+        if gh.get_tag(repo_full, t.tag) is not None:
+            status = "exists"
+        else:
+            full = gh.resolve_commit(repo_full, t.commit) if t.commit else None
+            if full is None:
+                status = "missing-commit"
+            else:
+                gh.create_tag(repo_full, t.tag, full, tag_message(t, source_url))
+                status = "created"
+        out[t.tag] = status
+        log("tag", target=repo_full, tag=t.tag, commit=t.commit, status=status)
+    return out
+
+
+def run_fork(
+    plans: list[RepoPlan],
+    tapeouts: dict[str, list[Tapeout]],
+    gh: GitHub,
+    org: str,
+    *,
+    delay: float = 20,
+    sleep: Callable[[float], None] = time.sleep,
+    log: Log,
+) -> int:
+    """Fork and tag every strategy=fork plan. Returns the number of failed repos."""
+    todo = [p for p in plans if p.strategy == "fork"]
+    failed = 0
+    for i, p in enumerate(todo, 1):
+        n = f"{i}/{len(todo)}"
+        fields = {"n": n, "source": p.current_name, "target": p.target}
+        try:
+            status = ensure_fork(gh, p, org, sleep=sleep, log=log)
+            log("fork", status=status, **fields)
+            ensure_tags(
+                gh, p.target, tapeouts.get(p.source.key, []), f"https://github.com/{p.current_name}", log
+            )
+        except GitHubError as e:
+            failed += 1
+            log("fork", status=f"error: {e}", **fields)
+            continue
+        if status == "created":
+            sleep(delay)
+    return failed
+
+
+def _matches(p: RepoPlan, only: set[str]) -> bool:
+    names = {p.target.split("/", 1)[1].lower(), p.current_name.lower(), p.source.key}
+    return bool(names & only)
+
+
+def _fork(args) -> int:
+    plans = read_plans(args.plans)
+    if args.only:
+        only = {o.lower() for o in args.only}
+        plans = [p for p in plans if _matches(p, only)]
+    tapeouts = tapeouts_by_repo(load_designs(args.catalog))
+    log = EventLog(args.log).write
+    failed = run_fork(plans, tapeouts, GhCli(), args.org, delay=args.delay, log=log)
+    return 1 if failed else 0
+
+
+def add_subcommand(subparsers) -> None:
+    p = subparsers.add_parser("fork", help="fork strategy=fork repos into the bench org and tag tapeouts")
+    p.add_argument(
+        "--only", nargs="+", metavar="NAME", help="only these repos (bench, current or source name)"
+    )
+    p.add_argument("--delay", type=float, default=20, help="seconds to wait after each created fork")
+    p.set_defaults(handler=_fork)
