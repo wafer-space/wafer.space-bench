@@ -18,9 +18,11 @@ class Stub:
     def __init__(self, *responses):
         self.responses = list(responses)
         self.cmds = []
+        self.inputs = []  # the `input` (stdin) of each call, None if none
 
     def __call__(self, cmd, **kw):
         self.cmds.append(cmd)
+        self.inputs.append(kw.get("input"))
         rc, out, err = self.responses.pop(0)
         if not isinstance(out, str):
             out = json.dumps(out)
@@ -475,3 +477,138 @@ def test_ghcli_branches_visible_false_on_404_and_409():
 def test_ghcli_branches_visible_other_error_raises():
     with pytest.raises(GitHubError):
         GhCli(runner=Stub(fail("gh: Server Error (HTTP 500)"))).branches_visible("o/x")
+
+
+# --- GhCli: repository settings -------------------------------------------------
+
+
+def test_ghcli_get_repo_settings():
+    resp = {"description": None, "homepage": "", "has_issues": True, "has_projects": False,
+            "has_wiki": True, "has_discussions": False, "has_pull_requests": True, "size": 3}  # fmt: skip
+    without_prs = {k: v for k, v in resp.items() if k != "has_pull_requests"}
+    stub = Stub(ok(resp), ok(without_prs))
+    gh = GhCli(runner=stub)
+    got = gh.get_repo_settings("o/x")
+    assert stub.cmds[0] == ["gh", "api", "-X", "GET", "repos/o/x"]
+    assert got == {"description": None, "homepage": "", "has_issues": True, "has_projects": False,
+                   "has_wiki": True, "has_discussions": False, "has_pull_requests": True}  # fmt: skip
+    assert gh.get_repo_settings("o/x")["has_pull_requests"] is None
+
+
+def test_ghcli_update_repo_args():
+    stub = Stub(ok({}))
+    GhCli(runner=stub).update_repo("o/x", {"has_wiki": False, "description": "d @x"})
+    assert stub.cmds == [
+        ["gh", "api", "-X", "PATCH", "repos/o/x", "-F", "has_wiki=false", "-f", "description=d @x"]
+    ]
+    assert stub.inputs == [None]
+
+
+def test_ghcli_topics_args():
+    stub = Stub(ok({"names": ["b", "a"]}), ok({"names": ["a", "b"]}))
+    gh = GhCli(runner=stub)
+    assert gh.get_topics("o/x") == ["b", "a"]
+    gh.set_topics("o/x", ["a", "b"])
+    assert stub.cmds == [
+        ["gh", "api", "-X", "GET", "repos/o/x/topics"],
+        ["gh", "api", "-X", "PUT", "repos/o/x/topics", "--input", "-"],
+    ]
+    assert json.loads(stub.inputs[1]) == {"names": ["a", "b"]}
+
+
+def test_ghcli_actions_args():
+    stub = Stub(ok({"enabled": True, "allowed_actions": "all"}), ok(""))
+    gh = GhCli(runner=stub)
+    assert gh.get_actions_enabled("o/x") is True
+    gh.set_actions_enabled("o/x", False)
+    assert stub.cmds == [
+        ["gh", "api", "-X", "GET", "repos/o/x/actions/permissions"],
+        ["gh", "api", "-X", "PUT", "repos/o/x/actions/permissions", "-F", "enabled=false"],
+    ]
+
+
+def test_ghcli_vulnerability_alerts_args():
+    stub = Stub(ok(""), fail("gh: Not Found (HTTP 404)"), ok(""), ok(""), ok(""))
+    gh = GhCli(runner=stub)
+    assert gh.get_vulnerability_alerts("o/x") is True
+    assert gh.get_vulnerability_alerts("o/x") is False
+    gh.set_vulnerability_alerts("o/x", False)
+    gh.set_vulnerability_alerts("o/x", True)
+    assert stub.cmds == [
+        ["gh", "api", "-X", "GET", "repos/o/x/vulnerability-alerts"],
+        ["gh", "api", "-X", "GET", "repos/o/x/vulnerability-alerts"],
+        ["gh", "api", "-X", "DELETE", "repos/o/x/automated-security-fixes"],
+        ["gh", "api", "-X", "DELETE", "repos/o/x/vulnerability-alerts"],
+        ["gh", "api", "-X", "PUT", "repos/o/x/vulnerability-alerts"],
+    ]
+
+
+def test_ghcli_vulnerability_alerts_other_error_raises():
+    with pytest.raises(GitHubError):
+        GhCli(runner=Stub(fail("gh: Forbidden (HTTP 403)"))).get_vulnerability_alerts("o/x")
+
+
+def test_ghcli_list_rulesets_reads_each_detail():
+    detail = {"id": 7, "name": "bench-frozen-branches", "target": "branch", "rules": [{"type": "update"}]}
+    stub = Stub(ok([[{"id": 7, "name": "bench-frozen-branches"}]]), ok(detail))
+    assert GhCli(runner=stub).list_rulesets("o/x") == [detail]
+    assert stub.cmds == [
+        [
+            "gh",
+            "api",
+            "-X",
+            "GET",
+            "repos/o/x/rulesets?includes_parents=false&per_page=100",
+            "--paginate",
+            "--slurp",
+        ],
+        ["gh", "api", "-X", "GET", "repos/o/x/rulesets/7"],
+    ]
+
+
+def test_ghcli_put_ruleset_creates_or_updates_by_name():
+    body = {"name": "bench-frozen-tags", "target": "tag", "rules": [{"type": "deletion"}]}
+    stub = Stub(
+        ok([[{"id": 3, "name": "other"}]]),
+        ok({"id": 9}),
+        ok([[{"id": 3, "name": "other"}, {"id": 9, "name": "bench-frozen-tags"}]]),
+        ok({"id": 9}),
+    )
+    gh = GhCli(runner=stub)
+    gh.put_ruleset("o/x", body)
+    gh.put_ruleset("o/x", body)
+    listing = [
+        "gh",
+        "api",
+        "-X",
+        "GET",
+        "repos/o/x/rulesets?includes_parents=false&per_page=100",
+        "--paginate",
+        "--slurp",
+    ]
+    assert stub.cmds == [
+        listing,
+        ["gh", "api", "-X", "POST", "repos/o/x/rulesets", "--input", "-"],
+        listing,
+        ["gh", "api", "-X", "PUT", "repos/o/x/rulesets/9", "--input", "-"],
+    ]
+    assert json.loads(stub.inputs[1]) == body == json.loads(stub.inputs[3])
+
+
+def test_ghcli_body_is_passed_on_stdin():
+    seen = {}
+
+    def runner(cmd, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+    GhCli(runner=runner).set_topics("o/x", [])
+    assert json.loads(seen["input"]) == {"names": []}
+    assert seen["text"] is True and seen["capture_output"] is True
+
+
+def test_github_protocol_has_settings_methods():
+    for name in ("get_repo_settings", "update_repo", "get_topics", "set_topics", "get_actions_enabled",
+                 "set_actions_enabled", "get_vulnerability_alerts", "set_vulnerability_alerts",
+                 "list_rulesets", "put_ruleset"):  # fmt: skip
+        assert hasattr(GitHub, name) and hasattr(GhCli, name) and hasattr(FakeGitHub, name), name

@@ -43,7 +43,7 @@ Every bench repo has the same branch namespaces:
   </thead>
   <tbody>
 {% for repo in repos %}
-    <tr>
+    <tr{% if repo.anchor != "" %} id="{{ repo.anchor | escape }}"{% endif %}>
       <td>{% if repo.url != "" %}<a href="{{ repo.url | escape }}">{{ repo.name | escape }}</a>{% else %}{{ repo.name | escape }}{% endif %}</td>
       <td>{% if repo.upstream != "" %}<a href="{{ repo.upstream | escape }}">{{ repo.upstream | escape }}</a>{% if repo.original_upstream != repo.upstream %} (was {{ repo.original_upstream | escape }}){% endif %}{% else %}no known repository{% endif %}</td>
       <td>{{ repo.strategy | escape }}</td>

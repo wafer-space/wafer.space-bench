@@ -76,6 +76,25 @@ jobs:
             args+=(--dry-run)
           fi
           uv run wsbench --remote-fmt 'https://github.com/{full}.git' --log work/events.jsonl sync "${args[@]}"
+      # Runs even when sync failed for some repo: settings do not depend on the branches,
+      # and a repo created since the last run gets its settings (and frozen rulesets) today.
+      - name: Settings
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ONLY: ${{ inputs.only }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          args=(--shard "$SHARD/8")
+          read -ra names <<< "$ONLY"
+          if [ "${#names[@]}" -gt 0 ]; then
+            args+=(--only "${names[@]}")
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          uv run wsbench --log work/events.jsonl settings "${args[@]}"
       # Saved even when sync exits 1 (some repo failed), so the next run starts warm.
       - uses: actions/cache/save@v4
         if: always()

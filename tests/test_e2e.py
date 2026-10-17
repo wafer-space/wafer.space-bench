@@ -7,8 +7,10 @@ for copies, as bare repos under a local `mirrors` prefix.
 """
 
 import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 from fakes import SyncedFake, sh
 
 from wafer_space_bench.catalog import Design, tapeouts_by_repo
@@ -19,11 +21,36 @@ from wafer_space_bench.git import Git
 from wafer_space_bench.index import index_rows
 from wafer_space_bench.layout import run_layouts
 from wafer_space_bench.scan import plan_repos
+from wafer_space_bench.settings import run_settings
 from wafer_space_bench.sync import INDEX_REPO, run_sync
 
 ORG = "wafer-space-bench"
 NOW = "2026-10-17T00:00:00Z"
 WRITES = ("set_ref", "delete_ref", "set_default_branch", "create_tag", "create_repo", "fork", "dispatch")
+SETTINGS_WRITES = (
+    "update_repo",
+    "set_topics",
+    "set_actions_enabled",
+    "set_vulnerability_alerts",
+    "put_ruleset",
+)
+
+# A pre-receive hook that does to git pushes what the bench-frozen rulesets do on GitHub:
+# a tapeout branch or tapeout tag may be created, never updated or deleted.
+FROZEN_HOOK = """#!/bin/sh
+zero=0000000000000000000000000000000000000000
+status=0
+while read old new ref; do
+  case "$ref" in
+    refs/heads/tapeout/*|refs/tags/wafer.space/*|refs/tags/google/*|refs/tags/tinytapeout/*)
+      if [ "$old" != "$zero" ]; then
+        echo "refused by bench-frozen: $ref" >&2
+        status=1
+      fi;;
+  esac
+done
+exit $status
+"""
 
 
 class Events(list):
@@ -36,14 +63,18 @@ class OrgFake(SyncedFake):
     gets the upstream's branches (pushed from `sources[upstream]`), a new repo starts empty.
     `get_file` reads the remote, as the contents API reads the repo."""
 
-    def __init__(self, root: Path, sources: dict[str, Path]):
+    def __init__(self, root: Path, sources: dict[str, Path], frozen: bool = False):
         super().__init__()
-        self.root, self.sources = root, sources
+        self.root, self.sources, self.frozen = root, sources, frozen
 
     def _new_remote(self, full: str) -> Path:
         path = self.root / f"{full}.git"
         path.parent.mkdir(parents=True, exist_ok=True)
         sh(self.root, "init", "-q", "--bare", str(path))
+        if self.frozen:  # pushes obey the rulesets too, not just API writes
+            hook = path / "hooks" / "pre-receive"
+            hook.write_text(FROZEN_HOOK)
+            hook.chmod(0o755)
         return path
 
     def fork(self, source_full_name, org, name):
@@ -84,15 +115,39 @@ def all_refs(root: Path) -> dict[str, str]:
 
 
 def writes(gh, since):
-    return [c for c in gh.calls[since:] if c[0] in WRITES]
+    return [c for c in gh.calls[since:] if c[0] in WRITES + SETTINGS_WRITES]
 
 
 def test_end_to_end_then_second_pass_writes_nothing(tmp_path, upstream):
+    scenario(tmp_path, upstream, rulesets=False)
+
+
+def test_layout_and_sync_work_under_rulesets(tmp_path, upstream):
+    """The same scenario with `wsbench settings` run right after fork and copy, so the
+    bench-frozen rulesets are in force (in the fake, and as a hook on every remote) for
+    layout and sync. Nothing is refused, and a second pass writes nothing either."""
+    gh = scenario(tmp_path, upstream, rulesets=True)
+    assert gh.refused == []
+    # The hook is live: moving a tapeout branch by a push is refused, as on GitHub.
+    upath, shas = upstream
+    one = tmp_path / "remotes" / ORG / "a--one.git"
+    branch = "refs/heads/tapeout/tinytapeout/ttgf0p2/tt_um_one"
+    with pytest.raises(subprocess.CalledProcessError):
+        sh(upath, "push", "-q", "--force", one.as_uri(), f"{shas['main']}:{branch}")
+    assert Git(one).rev_parse(branch) == shas["ttgf0p2"]
+    frozen = {r: set(rs) for r, rs in gh.rulesets.items() if rs}
+    assert frozen == {
+        f"{ORG}/{name}": {"bench-frozen-branches", "bench-frozen-tags"}
+        for name in ("a--one", "b--two", "0--zero")
+    }
+
+
+def scenario(tmp_path, upstream, *, rulesets):
     upath, shas = upstream
     root, mirrors = tmp_path / "remotes", tmp_path / "mirrors"
     for full in ("b/two", "0/zero"):  # copies are fetched from these local mirrors
         sh(tmp_path, "clone", "-q", "--bare", str(upath), str(mirrors / f"{full}.git"))
-    gh = OrgFake(root, {"a/one": upath})
+    gh = OrgFake(root, {"a/one": upath}, frozen=rulesets)
     gh.add_upstream("a/one", branches=shas)
     gh.add_upstream("b/two", network="a/one", branches=shas)
     gh.add_upstream(INDEX_REPO)
@@ -110,6 +165,10 @@ def test_end_to_end_then_second_pass_writes_nothing(tmp_path, upstream):
         tos = tapeouts_by_repo(designs)
         assert run_fork(plans, tos, gh, ORG, delay=0, **quiet) == 0
         assert run_copies(plans, tos, gh, cfg, ORG, fmt, sources={}, delay=0, **quiet) == 0
+        if rulesets:
+            assert (
+                run_settings(plans, tos, gh, ORG, only=None, shard=None, dry_run=False, delay=0, **quiet) == 0
+            )
         assert run_layouts(plans, tos, gh, cfg, ORG, remote_fmt=fmt, now=lambda: NOW, delay=0, **quiet) == 0
         assert run_sync(plans, tos, gh, cfg, ORG, remote_fmt=fmt, now=NOW, delay=0, **quiet) == 0
         return index_rows(plans, tapeouts_by_repo(designs, include_none=True), gh, ORG)
@@ -164,3 +223,4 @@ def test_end_to_end_then_second_pass_writes_nothing(tmp_path, upstream):
     n, before = len(gh.calls), all_refs(root)
     full_pass(plans)
     assert writes(gh, n) == [] and all_refs(root) == before
+    return gh

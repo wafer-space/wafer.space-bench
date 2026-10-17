@@ -63,6 +63,42 @@ class GitHub(Protocol):
     def get_file(self, full_name: str, path: str, ref: str) -> str | None: ...
     def dispatch(self, full_name: str, event_type: str) -> None: ...
 
+    # --- repository settings (`wsbench settings`) ---
+    def get_repo_settings(self, full_name: str) -> dict[str, Any]:
+        """description, homepage, has_issues, has_projects, has_wiki, has_discussions and
+        has_pull_requests (None when the API does not report it, so it cannot be set)."""
+        ...
+
+    def update_repo(self, full_name: str, fields: dict[str, Any]) -> None: ...
+    def get_topics(self, full_name: str) -> list[str]: ...
+    def set_topics(self, full_name: str, names: list[str]) -> None: ...
+    def get_actions_enabled(self, full_name: str) -> bool: ...
+    def set_actions_enabled(self, full_name: str, enabled: bool) -> None: ...
+    def get_vulnerability_alerts(self, full_name: str) -> bool: ...
+    def set_vulnerability_alerts(self, full_name: str, enabled: bool) -> None:
+        """Turn Dependabot alerts on or off; turning them off first turns off Dependabot
+        security updates (which need alerts)."""
+        ...
+
+    def list_rulesets(self, full_name: str) -> list[dict[str, Any]]:
+        """The repo's own rulesets (not the org's), each in full (conditions, rules, ...)."""
+        ...
+
+    def put_ruleset(self, full_name: str, ruleset: dict[str, Any]) -> None:
+        """Create `ruleset`, or replace the repo's ruleset of the same name."""
+        ...
+
+
+REPO_SETTINGS = (
+    "description",
+    "homepage",
+    "has_issues",
+    "has_projects",
+    "has_wiki",
+    "has_discussions",
+    "has_pull_requests",
+)
+
 
 def _q(s: str) -> str:
     """URL-quote a ref or path for the URL path (keeps `/`, escapes `#`, `%`, `?`)."""
@@ -107,7 +143,9 @@ class GhCli:
         method: str = "GET",
         fields: dict[str, str | bool] | None = None,
         paginate: bool = False,
+        body: Any = None,
     ) -> Any:
+        """`gh api`; `fields` become -f/-F flags, or `body` is sent as JSON on stdin."""
         cmd = ["gh", "api", "-X", method, endpoint]
         for k, v in (fields or {}).items():
             if isinstance(v, bool):
@@ -116,7 +154,11 @@ class GhCli:
                 cmd += ["-f", f"{k}={v}"]
         if paginate:
             cmd += ["--paginate", "--slurp"]
-        p = self._run(cmd, capture_output=True, text=True)
+        kw = {}
+        if body is not None:
+            cmd += ["--input", "-"]
+            kw["input"] = json.dumps(body)
+        p = self._run(cmd, capture_output=True, text=True, **kw)
         if p.returncode != 0:
             raise _classify(cmd, (p.stderr or "").strip())
         return json.loads(p.stdout) if p.stdout.strip() else {}
@@ -209,3 +251,53 @@ class GhCli:
 
     def dispatch(self, full_name: str, event_type: str) -> None:
         self._api(f"repos/{full_name}/dispatches", "POST", {"event_type": event_type})
+
+    def get_repo_settings(self, full_name: str) -> dict[str, Any]:
+        r = self._api(f"repos/{full_name}")
+        return {k: r.get(k) for k in REPO_SETTINGS}
+
+    def update_repo(self, full_name: str, fields: dict[str, Any]) -> None:
+        self._api(f"repos/{full_name}", "PATCH", fields)
+
+    def get_topics(self, full_name: str) -> list[str]:
+        return list(self._api(f"repos/{full_name}/topics").get("names") or [])
+
+    def set_topics(self, full_name: str, names: list[str]) -> None:
+        self._api(f"repos/{full_name}/topics", "PUT", body={"names": list(names)})
+
+    def get_actions_enabled(self, full_name: str) -> bool:
+        return bool(self._api(f"repos/{full_name}/actions/permissions")["enabled"])
+
+    def set_actions_enabled(self, full_name: str, enabled: bool) -> None:
+        self._api(f"repos/{full_name}/actions/permissions", "PUT", {"enabled": enabled})
+
+    def get_vulnerability_alerts(self, full_name: str) -> bool:
+        """HTTP 204 means on, 404 means off."""
+        try:
+            self._api(f"repos/{full_name}/vulnerability-alerts")
+        except NotFound:
+            return False
+        return True
+
+    def set_vulnerability_alerts(self, full_name: str, enabled: bool) -> None:
+        if enabled:
+            self._api(f"repos/{full_name}/vulnerability-alerts", "PUT")
+        else:
+            self._api(f"repos/{full_name}/automated-security-fixes", "DELETE")
+            self._api(f"repos/{full_name}/vulnerability-alerts", "DELETE")
+
+    def _ruleset_summaries(self, full_name: str) -> list[dict[str, Any]]:
+        pages = self._api(f"repos/{full_name}/rulesets?includes_parents=false&per_page=100", paginate=True)
+        return [r for page in pages for r in page]
+
+    def list_rulesets(self, full_name: str) -> list[dict[str, Any]]:
+        return [
+            self._api(f"repos/{full_name}/rulesets/{r['id']}") for r in self._ruleset_summaries(full_name)
+        ]
+
+    def put_ruleset(self, full_name: str, ruleset: dict[str, Any]) -> None:
+        ids = {r["name"]: r["id"] for r in self._ruleset_summaries(full_name)}
+        if ruleset["name"] in ids:
+            self._api(f"repos/{full_name}/rulesets/{ids[ruleset['name']]}", "PUT", body=ruleset)
+        else:
+            self._api(f"repos/{full_name}/rulesets", "POST", body=ruleset)

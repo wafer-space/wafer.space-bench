@@ -8,10 +8,16 @@ Models what the tooling relies on:
 - Renames: the old name keeps working and `get_repo` reports the new name.
 - Deleted repos raise `NotFound`.
 - Rate limits on creations (`rate_limit_next`) and slow fork readiness (`ready_after`).
+- Repository settings (`settings`, `topics`, `actions_enabled`, `vulnerability_alerts`,
+  `rulesets`). Active rulesets are enforced on API ref writes: a matching ref may not be
+  created (`creation`), moved (`update`, `non_fast_forward`) or deleted (`deletion`);
+  each refused write is appended to `refused`. `pull_requests_supported = False` models
+  an API that does not report (or accept) `has_pull_requests`.
 
 Inspection state is keyed by each repo's current full name.
 """
 
+import re
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
@@ -35,6 +41,13 @@ class FakeGitHub:
         self._rate_limited = 0
         self._ready_after = 0
         self._not_ready: dict[str, int] = {}
+        self.settings: dict[str, dict] = {}
+        self.topics: dict[str, list[str]] = {}
+        self.actions_enabled: dict[str, bool] = {}
+        self.vulnerability_alerts: dict[str, bool] = {}
+        self.rulesets: dict[str, dict[str, dict]] = {}  # repo -> ruleset name -> ruleset
+        self.refused: list[tuple[str, str, str]] = []  # (repo, ref, operation)
+        self.pull_requests_supported = True
 
     # --- test setup ---------------------------------------------------------
 
@@ -75,12 +88,48 @@ class FakeGitHub:
 
     # --- internals ----------------------------------------------------------
 
-    def _put(self, name, net, *, fork, default, archived=False, branches=None) -> None:
+    def _put(self, name, net, *, fork, default, archived=False, branches=None, description="") -> None:
         self.repos[name] = RepoInfo(name, fork, net, default, archived, 0)
         self._names[name.lower()] = name
         self.branches[name] = dict(branches or {})
         self.tags[name] = {}
         self.default_branch[name] = default
+        # GitHub's defaults for a new public repo (alerts on, as an org may set).
+        self.settings[name] = {
+            "description": description or None,
+            "homepage": None,
+            "has_issues": True,
+            "has_projects": True,
+            "has_wiki": True,
+            "has_discussions": False,
+            "has_pull_requests": True,
+        }
+        self.topics[name] = []
+        self.actions_enabled[name] = True
+        self.vulnerability_alerts[name] = True
+        self.rulesets[name] = {}
+
+    def _check_rules(self, name: str, ref: str, op: str) -> None:
+        """Refuse `op` ("creation", "update" or "deletion") of `ref` (heads/x, tags/x) if an
+        active ruleset of the repo covers it."""
+        kind, _ = self._split_ref(ref)
+        full_ref = f"refs/{ref}"
+        blocking = {
+            "creation": {"creation"},
+            "update": {"update", "non_fast_forward"},
+            "deletion": {"deletion"},
+        }
+        for rs in self.rulesets[name].values():
+            if rs["enforcement"] != "active" or rs["target"] != ("branch" if kind == "heads" else "tag"):
+                continue
+            cond = rs["conditions"]["ref_name"]
+            if not any(_glob(p, full_ref) for p in cond["include"]) or any(
+                _glob(p, full_ref) for p in cond.get("exclude", [])
+            ):
+                continue
+            if blocking[op] & {r["type"] for r in rs["rules"]}:
+                self.refused.append((name, ref, op))
+                raise GitHubError(f"repos/{name}/git/refs: Repository rule violations found (HTTP 422)")
 
     def _resolve(self, full: str) -> str:
         name = self._names.get(full.lower())
@@ -151,6 +200,7 @@ class FakeGitHub:
         self._check_sha(name, sha)
         if tag in self.tags[name]:
             raise GitHubError(f"repos/{name}/git/refs: Reference already exists (HTTP 422)")
+        self._check_rules(name, f"tags/{tag}", "creation")
         self.tags[name][tag] = sha
 
     def create_repo(self, org: str, name: str, description: str) -> None:
@@ -160,7 +210,7 @@ class FakeGitHub:
         if full.lower() in self._names:
             raise GitHubError(f"orgs/{org}/repos: name already exists on this account (HTTP 422)")
         self.networks[full] = set()
-        self._put(full, full, fork=False, default="main")
+        self._put(full, full, fork=False, default="main", description=description)
 
     def set_default_branch(self, full_name: str, branch: str) -> None:
         self._record("set_default_branch", full_name, branch)
@@ -187,6 +237,7 @@ class FakeGitHub:
         name = self._resolve(full_name)
         kind, short = self._split_ref(ref)
         self._check_sha(name, sha)
+        self._check_rules(name, ref, "update" if short in self._refs(name, kind) else "creation")
         self._refs(name, kind)[short] = sha
 
     def delete_ref(self, full_name: str, ref: str) -> None:
@@ -198,6 +249,7 @@ class FakeGitHub:
         refs = self._refs(name, kind)
         if short not in refs:
             raise GitHubError(f"repos/{name}/git/refs/{ref}: Reference does not exist (HTTP 422)")
+        self._check_rules(name, ref, "deletion")
         del refs[short]
 
     def get_file(self, full_name: str, path: str, ref: str) -> str | None:
@@ -206,6 +258,69 @@ class FakeGitHub:
     def dispatch(self, full_name: str, event_type: str) -> None:
         self._record("dispatch", full_name, event_type)
         self.dispatches.append((self._resolve(full_name), event_type))
+
+    # --- repository settings --------------------------------------------------
+
+    def get_repo_settings(self, full_name: str) -> dict:
+        got = dict(self.settings[self._resolve(full_name)])
+        if not self.pull_requests_supported:
+            got["has_pull_requests"] = None
+        return got
+
+    def update_repo(self, full_name: str, fields: dict) -> None:
+        self._record("update_repo", full_name, dict(fields))
+        name = self._resolve(full_name)
+        unknown = set(fields) - set(self.settings[name])
+        if unknown or ("has_pull_requests" in fields and not self.pull_requests_supported):
+            raise GitHubError(f"repos/{name}: Validation Failed: {sorted(fields)} (HTTP 422)")
+        self.settings[name].update(fields)
+
+    def get_topics(self, full_name: str) -> list[str]:
+        return list(self.topics[self._resolve(full_name)])
+
+    def set_topics(self, full_name: str, names: list[str]) -> None:
+        self._record("set_topics", full_name, list(names))
+        bad = [n for n in names if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,49}", n)]
+        if bad or len(names) > 20:
+            raise GitHubError(f"repos/{full_name}/topics: Invalid topics {bad} (HTTP 422)")
+        self.topics[self._resolve(full_name)] = list(names)
+
+    def get_actions_enabled(self, full_name: str) -> bool:
+        return self.actions_enabled[self._resolve(full_name)]
+
+    def set_actions_enabled(self, full_name: str, enabled: bool) -> None:
+        self._record("set_actions_enabled", full_name, enabled)
+        self.actions_enabled[self._resolve(full_name)] = enabled
+
+    def get_vulnerability_alerts(self, full_name: str) -> bool:
+        return self.vulnerability_alerts[self._resolve(full_name)]
+
+    def set_vulnerability_alerts(self, full_name: str, enabled: bool) -> None:
+        self._record("set_vulnerability_alerts", full_name, enabled)
+        self.vulnerability_alerts[self._resolve(full_name)] = enabled
+
+    def list_rulesets(self, full_name: str) -> list[dict]:
+        return [dict(r) for r in self.rulesets[self._resolve(full_name)].values()]
+
+    def put_ruleset(self, full_name: str, ruleset: dict) -> None:
+        self._record("put_ruleset", full_name, ruleset["name"])
+        name = self._resolve(full_name)
+        if ruleset["target"] not in ("branch", "tag") or not all(
+            p.startswith("refs/") for p in ruleset["conditions"]["ref_name"]["include"]
+        ):
+            raise GitHubError(f"repos/{name}/rulesets: Validation Failed (HTTP 422)")
+        old = self.rulesets[name].get(ruleset["name"])
+        rid = old["id"] if old else 1 + sum(len(r) for r in self.rulesets.values())
+        self.rulesets[name][ruleset["name"]] = {"id": rid, "source_type": "Repository"} | ruleset
+
+
+def _glob(pattern: str, ref: str) -> bool:
+    """fnmatch as rulesets use it: `**` matches across `/`, `*` within one segment."""
+    rx = "".join(
+        ".*" if part == "**" else "[^/]*" if part == "*" else re.escape(part)
+        for part in re.split(r"(\*\*|\*)", pattern)
+    )
+    return re.fullmatch(rx, ref) is not None
 
 
 def sh(cwd, *args) -> str:

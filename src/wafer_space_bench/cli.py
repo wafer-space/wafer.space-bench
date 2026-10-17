@@ -3,12 +3,12 @@
 import argparse
 from pathlib import Path
 
-from wafer_space_bench import copy, fork, index, layout, scan, sync
+from wafer_space_bench import copy, fork, index, layout, scan, settings, sync
 
 # Later tasks add modules here; each exposes ``add_subcommand(subparsers)``.
 # Handler contract: add_subcommand must call ``parser.set_defaults(handler=fn)``, where
 # ``fn(args)`` returns an int exit code (or None, meaning 0).
-SUBCOMMAND_MODULES: tuple = (scan, fork, copy, layout, index, sync)
+SUBCOMMAND_MODULES: tuple = (scan, fork, copy, layout, index, sync, settings)
 
 
 def build_parser() -> argparse.ArgumentParser:

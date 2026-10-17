@@ -45,6 +45,7 @@ def _row(plan: RepoPlan, state: str) -> dict:
     src = plan.source
     return {
         "name": name,
+        "anchor": name,  # the row's id; each bench repo's homepage links to it
         "url": f"https://github.com/{plan.target}",
         "upstream": f"https://{src.host}/{plan.current_name or src.full_name}",
         "original_upstream": src.url,
@@ -63,7 +64,7 @@ def _no_source_row(plan: RepoPlan, tapeouts: list[Tapeout]) -> dict:
     row = _row(plan, "no-source")
     if not plan.target:
         name = next((t.project for t in tapeouts if t.project), plan.source.name)
-        row |= {"name": name, "url": "", "upstream": "", "original_upstream": ""}
+        row |= {"name": name, "anchor": "", "url": "", "upstream": "", "original_upstream": ""}
     _from_catalog(row, tapeouts)
     return row
 

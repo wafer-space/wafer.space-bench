@@ -79,7 +79,7 @@ after a failure finishes the job.
    Original branches are deleted only after every new branch is verified and `about` is
    the default branch.
 
-The other two run unattended in GitHub Actions (see Automation), and can be run by hand:
+The other three run unattended in GitHub Actions (see Automation), and can be run by hand:
 
 5. `wsbench sync`: per bench repo, mirrors upstream's branches onto `upstream/*`
    (deletes first), adds new tapeout tags and `tapeout/*` branches, and regenerates
@@ -88,17 +88,36 @@ The other two run unattended in GitHub Actions (see Automation), and can be run 
    and `--changed-file` are for the workflow.
 6. `wsbench index --out DIR`: writes the Jekyll source of the index site: the `site/`
    template (or `--site DIR`) plus `_data/repos.json`, read from the org.
+7. `wsbench settings`: brings every bench repo to the archival-mirror settings. It reads
+   each repo's current state and writes only what differs, so a second run writes
+   nothing; a repo not created yet is `pending`.
+   - Issues, Projects, Wiki and Discussions off. Pull requests off where the API reports
+     `has_pull_requests`; otherwise they are left alone and `pull-requests-unsupported`
+     is logged once.
+   - Description `Benchmark copy of <upstream URL>: <N> tapeout(s) on <runs>`, with
+     ` (upstream deleted)` for a restore; homepage
+     `https://wafer-space-bench.github.io/#<repo name>`, the repo's row in the index.
+   - Topics `wafer-space-bench`, `gf180mcu`, `open-silicon`, the strategy, the tapeout
+     orgs and runs (`wafer-space`, `ws-run1`, `ttgf0p2`, ...).
+   - Actions disabled; Dependabot alerts and security updates off.
+   - Rulesets `bench-frozen-branches` (`refs/heads/tapeout/**`) and `bench-frozen-tags`
+     (`refs/tags/wafer.space/**`, `google/**`, `tinytapeout/**`): no update, deletion or
+     force-push, with no bypass for anyone, the App included. Creating a tapeout branch or
+     tag stays allowed, so the other commands keep working.
+
+   `--shard K/N` takes the same slices as `sync`; `--delay` (default 1 s) paces the repos
+   that changed. Forking stays allowed.
 
 GitHub rate-limits repo creation (about 150 in 30 minutes). `fork` and `copy` pace
 creations 20 s apart (`--delay`) and back off from 60 s up to 960 s when refused.
 
-Options shared by `fork`, `copy`, `layout` and `sync`:
+Options shared by `fork`, `copy`, `layout`, `sync` and `settings`:
 
 - `--only NAME...`: only these repos. A name may be the bench name (`owner--repo`), the
   current upstream name or the catalog's source name (`owner/repo`), in any case; a
   `none` design is named `<shuttle>/<code>`. If no name matches a plan the command
   handles, it prints a warning and exits 2.
-- `--dry-run` (`copy`, `layout`, `sync`): log what would be done, write nothing.
+- `--dry-run` (`copy`, `layout`, `sync`, `settings`): log what would be done, write nothing.
 
 Exit codes: 0 for success; 1 if any repo failed (an error, a layout conflict, an `empty`
 repo for `layout`, `no source` for `copy`); 2 for usage errors and an `--only` that
@@ -134,18 +153,21 @@ leave this machine: they are not allowed in anything committed or published.
 | Workflow | Lives in | Runs | Does |
 |---|---|---|---|
 | `.github/workflows/ci.yml` | this repo | push, pull request | ruff, tests, actionlint |
-| `.github/workflows/sync.yml` | this repo | daily 03:17 UTC; manual, with `only` and `dry_run` inputs | `wsbench sync` in 8 shards (at most 2 at once), then one index dispatch |
+| `.github/workflows/sync.yml` | this repo | daily 03:17 UTC; manual, with `only` and `dry_run` inputs | `wsbench sync` then `wsbench settings` in 8 shards (at most 2 at once), then one index dispatch |
 | `index-repo/.github/workflows/pages.yml` | `wafer-space-bench/wafer-space-bench.github.io` | every 6 hours, manual, `repository_dispatch: bench-updated` | `wsbench index`, Jekyll build, deploy to Pages |
 
 Each sync shard mints its own GitHub App token (a token lasts 60 minutes) and keeps its
-`work/mirrors` in the Actions cache. Shards run with `--no-dispatch` and upload a
+`work/mirrors` in the Actions cache. After its sync it runs `wsbench settings` on the same
+shard, even when the sync failed, so a repo created since the last run gets its settings
+and frozen rulesets the same day. Shards run with `--no-dispatch` and upload a
 `changed` marker with their event log. The final `notify` job dispatches `bench-updated`
 to the index repo once, if any shard changed something.
 
 One-time setup:
 
 1. Create a GitHub App (`wafer-space-bench-bot`) owned by the `wafer-space-bench` org,
-   with repository permissions Administration read/write (default branch), Contents
+   with repository permissions Administration read/write (default branch, and every
+   `wsbench settings` write: features, topics, Actions, Dependabot, rulesets), Contents
    read/write, Workflows read/write (mirrored branches may change `.github/workflows`)
    and Metadata read. It needs no webhook.
 2. Install it on all repositories of `wafer-space-bench`.

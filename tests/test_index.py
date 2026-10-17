@@ -153,7 +153,7 @@ def test_index_rows_sorted_and_json_serialisable():
     rows = index_rows(plans, {"z/last": [tapeout("z/last")]}, gh, ORG)
     assert [r["name"] for r in rows] == ["A--first", "b--x", "z--Last"]
     keys = {
-        "name", "url", "upstream", "original_upstream", "strategy", "state",
+        "name", "anchor", "url", "upstream", "original_upstream", "strategy", "state",
         "tapeouts", "runs", "licence", "branches", "generated",
     }  # fmt: skip
     assert all(set(r) == keys for r in rows)
