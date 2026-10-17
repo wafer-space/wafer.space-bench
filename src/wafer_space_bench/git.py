@@ -9,8 +9,8 @@ import subprocess
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-NAME = "wafer-space-bench"
-EMAIL = "bench@wafer.space"
+NAME = "wafer.space Robotic Helper"
+EMAIL = "robot@wafer.space"
 IDENTITY = f"{NAME} <{EMAIL}>"
 
 _CONFIG = [
