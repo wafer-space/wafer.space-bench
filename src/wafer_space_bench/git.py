@@ -97,6 +97,11 @@ class Git:
         out = _run(["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"], cwd=self.path, check=False)
         return out.strip() or None
 
+    def show(self, ref: str, path: str) -> str | None:
+        """The text of file `path` at `ref`, or None if either is absent."""
+        out = _run(["show", f"{ref}:{path}"], cwd=self.path, check=False)
+        return out if out else None
+
     def update_ref(self, ref: str, target: str) -> None:
         self._git("update-ref", ref, target)
 

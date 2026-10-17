@@ -127,3 +127,12 @@ def test_non_utf8_output_does_not_raise(tmp_path, upstream):
         [b"git", b"update-ref", b"refs/heads/caf\xe9", shas["main"].encode()], cwd=g.path, check=True
     )
     assert len(g.heads()) == 4
+
+
+def test_show_reads_blob_or_none(tmp_path):
+    g = Git.init_bare(tmp_path / "r.git")
+    c = g.commit_tree(g.mktree({"a.txt": g.hash_blob("hello\n")}), [], "m")
+    g.update_ref("refs/heads/x", c)
+    assert g.show("refs/heads/x", "a.txt") == "hello\n"
+    assert g.show("refs/heads/x", "missing") is None
+    assert g.show("refs/heads/nope", "a.txt") is None
