@@ -17,7 +17,7 @@ package is the first content of the public repo `wafer-space/wafer.space-bench`.
 |---|---|---|
 | `wafer-space/wafer.space-bench` | public | this tooling, the design catalog, public notes and results |
 | `wafer-space/wafer.space-bench-private` | private | NDA and other private material (not this plan) |
-| `wafer-space-bench/wafer-space-bench.github.io` | public | Jekyll GitHub Pages index of the bench repos |
+| `wafer-space-bench/wafer-space-bench.github.io` | public | the Pages workflow that builds the index; its source lives in the tooling repo's `index-repo/` |
 | `wafer-space-bench/<owner>--<repo>` | public | one per upstream benchmark repo |
 
 ## Naming
@@ -78,7 +78,55 @@ action appends one JSON line to an event log.
 2. `fork`: create forks and tapeout tags.
 3. `copy`: create copy/restore repos, push branches and tags.
 4. `layout`: apply the branch namespaces and generate the `about` branch.
-5. `index`: generate the index site data.
+5. `sync`: keep existing bench repos current (see Automation).
+6. `index`: generate the index site data by reading the bench repos.
+
+`scan`, `fork` and `copy` are run by hand (they create repos, hit the
+creation rate limit, and `restore` needs local mirrors). `sync` and `index`
+run unattended on a schedule.
+
+## Automation (GitHub Actions)
+
+| Workflow | Lives in | Schedule | Auth | Does |
+|---|---|---|---|---|
+| `sync.yml` | `wafer-space/wafer.space-bench` | daily, plus manual dispatch (`only`, `dry_run` inputs) | GitHub App installation token | `wsbench sync`, then triggers the index rebuild |
+| `ci.yml` | `wafer-space/wafer.space-bench` | push, pull request | none | lint, format, tests, actionlint |
+| `pages.yml` | `wafer-space-bench/wafer-space-bench.github.io` | every 6 hours, manual, `repository_dispatch: bench-updated` | the workflow's own read-only `GITHUB_TOKEN` | check out the tooling repo, `wsbench index`, Jekyll build, deploy to Pages |
+
+**`sync` per bench repo:**
+- Not laid out yet: run `layout`.
+- Mirror upstream branches to `upstream/<b>`: create, force-update and delete
+  so `upstream/*` exactly matches upstream. A `fork` mirrors through the REST
+  refs API (the commits are already in the fork network, so no clone). A
+  `copy` of a live upstream fetches it and pushes. A `restore` has no
+  upstream and is skipped.
+- Upstream gone (404): change nothing, log `upstream-missing`.
+- Deletes are applied before creates, so an upstream branch renamed from `x`
+  to `x/y` does not collide with the old `upstream/x`.
+- One repo failing (API or git error) is logged and the run continues; the
+  command exits non-zero at the end if any repo failed.
+- Create any tapeout tags and `tapeout/*` branches the catalog has that the repo lacks.
+- Regenerate `about` when the branch list or tapeouts changed; no commit otherwise.
+- Never touch `tapeout/*`, tags or `dev/*`.
+
+**Index pulls from the org:** it lists the org's repos and reads each repo's
+`about:bench.yaml` through the contents API. Repos planned in
+`data/bench_repos.csv` but absent from the org appear as `pending`. The
+generated data is never committed; Pages is built by the workflow
+(`build_type=workflow`).
+
+**Delegated auth: one GitHub App** (`wafer-space-bench-bot`) installed on all
+repos of `wafer-space-bench`, not deploy keys (one key per repo would mean
+hundreds of keys). Repository permissions: Administration read/write (default
+branch), Contents read/write, Workflows read/write (mirrored branches may
+change `.github/workflows`), Metadata read. The tooling repo holds variable
+`BENCH_APP_ID` and secret `BENCH_APP_PRIVATE_KEY`. The workflow mints a token
+with `actions/create-github-app-token` (`owner: wafer-space-bench`) and runs
+`gh auth setup-git` so git pushes use it.
+
+**Actions are disabled in the bench repos** (org policy: enabled only for the
+index repo). Otherwise every mirrored branch push would run the upstream
+designs' CI in our org.
 
 ## Privacy rule
 
@@ -95,5 +143,5 @@ locations come only from a git-ignored local config file.
 - **Git operations run for real** against temporary repositories on disk, with
   `file://` remotes.
 - **Sleeps are injected,** so backoff is tested without waiting.
-- **CI on GitHub Actions** runs lint, format check and tests on every push and
-  pull request.
+- **CI on GitHub Actions** runs lint, format check, tests and `actionlint` on
+  every push and pull request.

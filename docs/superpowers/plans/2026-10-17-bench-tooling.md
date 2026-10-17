@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn the one-off `experiments/tools/bench_*.py` scripts into a tested, CI-checked Python package (`wsbench`). It is the first content of `wafer-space/wafer.space-bench`. It finds benchmark repos, forks or copies them into `wafer-space-bench`, applies the branch layout and generates the index site.
+**Goal:** Turn the one-off `experiments/tools/bench_*.py` scripts into a tested, CI-checked Python package (`wsbench`). It is the first content of `wafer-space/wafer.space-bench`. It finds benchmark repos, forks or copies them into `wafer-space-bench`, applies the branch layout, keeps them in sync with upstream from a scheduled Action, and generates the index site from a scheduled Pages workflow.
 
 **Architecture:**
 - A `src/` layout package. Pure logic (naming, catalog, planning, README rendering, index rows) is separated from two side-effect boundaries: a `GitHub` protocol (real: `gh api`; tests: an in-memory fake) and a `Git` wrapper (real git on temp repos in tests).
@@ -25,6 +25,8 @@
 - **Rate limit:** on HTTP 403 "was submitted too quickly", back off 60 s, doubling, capped at 960 s, and retry the same repo. Default pacing between creations is 20 s.
 - **Privacy:** no committed file or published string may contain `/backups`, `/home/`, `big-storage`, `~/github` or `/tmp/claude`. Local mirror paths come only from git-ignored `bench.local.toml`.
 - **Tests:** no network (`pytest --disable-socket --allow-unix-socket`). Git runs for real in `tmp_path`.
+- **Automation:** `sync.yml` (daily, tooling repo, GitHub App token: `vars.BENCH_APP_ID`, `secrets.BENCH_APP_PRIVATE_KEY`, `owner: wafer-space-bench`) and `pages.yml` (every 6 h plus `repository_dispatch: bench-updated`, index repo, read-only `GITHUB_TOKEN`). No deploy keys. Generated index data is never committed. All workflow files pass `actionlint` in CI.
+- **Sync never touches** `tapeout/*`, tags or `dev/*`; it only creates, force-updates and deletes `upstream/*` (deletes first) and regenerates `about`.
 - **Conventions:** match `ws-run-reports` (src layout, hatchling, `[dependency-groups] dev`, `cli.py:main`). Licence Apache-2.0.
 - **Commit trailer:** `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -35,6 +37,7 @@
 3. **A taped-out commit unreachable from the bench repo.** That tag is reported as `missing-commit`; other tags still get created. Covered by `test_tags_missing_commit` (Task 6).
 4. **A local path leaking into a tag message, description, README or index.** The privacy tests fail. Covered by `test_no_banned_strings_in_tracked_files` (Task 1), `test_tag_message_has_no_local_paths` (Task 6) and `test_copy_description_public` (Task 7).
 5. **An upstream renamed between scan and fork.** The target uses the current name, and tags still match the catalog's original URL. Covered by `test_plan_renamed_repo` (Task 5) and `test_tapeouts_match_original_url` (Task 3).
+6. **Upstream force-pushes, deletes or renames a branch between syncs.** `upstream/*` follows exactly; `tapeout/*` and tags keep the taped-out commits. Covered by `test_sync_fork_uses_refs_api` and `test_sync_never_touches_tapeout_or_dev` (Task 11).
 
 ---
 
@@ -42,7 +45,7 @@
 
 **Files:**
 - Create: `pyproject.toml`, `README.md`, `LICENSE` (Apache-2.0), `.gitignore`, `src/wafer_space_bench/__init__.py`, `src/wafer_space_bench/cli.py`, `.github/workflows/ci.yml`, `tests/test_privacy.py`, `tests/test_cli.py`
-- Move in: `docs/superpowers/specs/2026-10-17-bench-tooling-design.md`, `docs/superpowers/plans/2026-10-17-bench-tooling.md` (from `experiments/`)
+- Already present: the spec and this plan (imported in the first commit)
 
 **Interfaces:**
 - Produces: `wafer_space_bench.cli.main(argv: list[str] | None = None) -> int`; console script `wsbench`. Each later task adds a subcommand via `add_subcommand(subparsers)` in its module, registered in `cli.py`.
@@ -57,7 +60,7 @@ Working copy: `~/github/wafer-space/wafer.space-bench` (`git init`). The GitHub 
   - `[tool.pytest.ini_options] testpaths = ["tests"]`, `addopts = "--disable-socket --allow-unix-socket"`.
   - `[tool.ruff] line-length = 110`.
   - Then run `uv lock`.
-- [ ] **Step 2: `.gitignore`.** Ignore `bench.local.toml`, `*.jsonl`, `.venv/`, `__pycache__/`, `work/`.
+- [ ] **Step 2: `.gitignore`.** Ignore `bench.local.toml`, `*.jsonl`, `.venv/`, `__pycache__/`, `work/`, `.superpowers/`, `out/`, `_site_src/`.
 - [ ] **Step 3: Write the failing tests**
 
 ```python
@@ -89,6 +92,7 @@ def test_help_lists_subcommands(capsys):
   - Trigger on `push` and `pull_request`; runs on `ubuntu-latest`.
   - Steps: `actions/checkout@v4` (`fetch-depth: 0`), `astral-sh/setup-uv@v6`, `uv sync --locked`, `uv run ruff check`, `uv run ruff format --check`, `uv run pytest -q`.
   - Matrix: Python `3.11` and `3.13` via `uv python install`.
+  - A separate `actionlint` job: `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color .github/workflows/*.yml` (later tasks add `index-repo/.github/workflows/*.yml` to the list). Run it locally the same way, in Docker.
 - [ ] **Step 7: Run** `uv run pytest -q && uv run ruff check && uv run ruff format --check`. Expected: all pass.
 - [ ] **Step 8: Commit** "Scaffold wafer.space-bench package, CI and privacy test".
 
@@ -199,14 +203,23 @@ def test_real_catalog_has_unique_tags():
     - `create_tag(full_name, tag, sha, message) -> None`;
     - `create_repo(org, name, description) -> None`;
     - `set_default_branch(full_name, branch) -> None`;
-    - `list_repos(org) -> list[RepoInfo]`.
+    - `list_repos(org) -> list[RepoInfo]` (paginated);
+    - `list_branches(full_name) -> dict[str, str]` (branch name → SHA, paginated);
+    - `set_ref(full_name, ref, sha) -> None`: `ref` like `heads/upstream/main`; creates it, or force-updates it if it exists;
+    - `delete_ref(full_name, ref) -> None`;
+    - `get_file(full_name, path, ref) -> str | None`: decoded text via the contents API, `None` on 404;
+    - `dispatch(full_name, event_type) -> None`: `repository_dispatch`.
   - `GhCli(runner=subprocess.run)` implements it with `gh api`.
   - `tests/fakes.py::FakeGitHub` implements it in memory:
-    - `add_upstream(full, network=None, commits=(), deleted=False, renamed_to=None, archived=False)`;
+    - `add_upstream(full, network=None, commits=(), branches=None, deleted=False, renamed_to=None, archived=False)`; `branches` is `{name: sha}`, and its SHAs are added to `commits`;
     - `rate_limit_next(n)`, which makes the next `n` creations raise `RateLimited`;
     - `ready_after(n)`, which makes `branches_visible` false for the first `n` polls;
-    - inspection dicts `.repos`, `.tags` and `.default_branch`.
-  - The fake enforces the fork-network rule: one repo per network per org. A second fork raises `GitHubError("already forked in network")`.
+    - inspection dicts `.repos`, `.tags`, `.branches` (`{full: {name: sha}}`), `.files` (`{(full, ref, path): text}`), `.default_branch`, `.dispatches` (list of `(full, event_type)`), and `.calls`, an ordered list of `(method, args)` for every mutating call.
+  - The fake enforces these GitHub rules:
+    - One repo per network per org. A second fork raises `GitHubError("already forked in network")`.
+    - A fork starts with a copy of the upstream's branches and can reference every commit in the network.
+    - `set_ref` or `create_tag` with a SHA not in the repo's network raises `GitHubError`.
+    - `delete_ref` of the default branch raises `GitHubError`.
 
 - [ ] **Step 1: Failing tests**
   - **GhCli:** `runner` is replaced by a stub returning `CompletedProcess`.
@@ -217,7 +230,12 @@ def test_real_catalog_has_unique_tags():
   - **Contract tests**, parametrised over `FakeGitHub` only:
     - `test_fake_one_fork_per_network`;
     - `test_fake_rate_limit_then_ok`;
-    - `test_fake_renamed_repo_reports_current_name`.
+    - `test_fake_renamed_repo_reports_current_name`;
+    - `test_fake_set_ref_rejects_foreign_sha`;
+    - `test_fake_cannot_delete_default_branch`.
+  - `test_ghcli_list_branches_paginates`: the stub returns two pages (`--paginate` output concatenated as `gh` prints it); the result has every branch.
+  - `test_ghcli_set_ref_updates_then_creates`: the PATCH (`force=true`) gets a 422 "Reference does not exist", so a POST to `git/refs` follows.
+  - `test_ghcli_get_file_decodes_base64`.
 - [ ] **Step 2: Run.** Expected: FAIL.
 - [ ] **Step 3: Implement** `GhCli`. Port the `gh()` helper from `experiments/tools/bench_fork.py`, classifying errors by stderr. Then implement `FakeGitHub`.
 - [ ] **Step 4: Run.** Expected: PASS.
@@ -367,21 +385,37 @@ def test_real_catalog_has_unique_tags():
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** "Add branch layout: about, upstream/*, tapeout/*".
 
-### Task 10: Index site
+### Task 10: Index site and its Pages workflow
 
 **Files:**
-- Create in the tooling repo: `src/wafer_space_bench/index.py`, `tests/test_index.py`, `site/_config.yml`, `site/index.md`, `site/assets/table.js`
-- Generated into the index repo checkout: `_data/repos.json`
+- Create in the tooling repo:
+  - `src/wafer_space_bench/index.py`, `tests/test_index.py`;
+  - `site/_config.yml`, `site/index.md`, `site/assets/table.js`;
+  - `index-repo/README.md` and `index-repo/.github/workflows/pages.yml`: the whole content of the index repo, pushed there in Task 12.
+- Modify: `.github/workflows/ci.yml` to add `index-repo/.github/workflows/*.yml` to actionlint.
+- Generated at build time only, never committed: `<out>/_data/repos.json`.
 
 **Interfaces:**
-- Consumes: Tasks 3, 4, 5.
+- Consumes: Tasks 3, 4, 5, 8 (`bench.yaml` keys).
 - Produces:
-  - `index_rows(plans, tapeouts, org_repos: list[RepoInfo]) -> list[dict]`. Each row has keys:
+  - `index_rows(plans, tapeouts, gh, org) -> list[dict]`. It reads the org via `gh.list_repos(org)` and, per repo, `gh.get_file(full, "bench.yaml", "about")`. Each row has keys:
     - `name, url, upstream, original_upstream, strategy`;
-    - `state`, one of `pending`, `forked`, `laid-out`, `no-source`;
-    - `tapeouts` (a list of tags), `runs` (sorted unique `org/run`), `licence`.
+    - `state`, one of `pending`, `created`, `laid-out`, `no-source`;
+    - `tapeouts` (a list of tags), `runs` (sorted unique `org/run`), `licence`, `branches` (count of `upstream/*` from `bench.yaml`), `generated`.
+  - For a `laid-out` repo, tapeouts, licence and source come from its `bench.yaml` (the repo is the truth). For other states they come from the plans and catalog.
   - `write_site(rows, site_dir: Path, out_dir: Path)` copies `site/` and writes `_data/repos.json`.
   - CLI: `wsbench index --out PATH`.
+- `index-repo/.github/workflows/pages.yml`:
+  - Triggers: `schedule` (`cron: "23 */6 * * *"`), `workflow_dispatch`, `repository_dispatch` (`types: [bench-updated]`).
+  - Permissions: `contents: read`, `pages: write`, `id-token: write`. Concurrency group `pages`.
+  - Steps:
+    1. `actions/checkout@v4` of `wafer-space/wafer.space-bench`.
+    2. `astral-sh/setup-uv@v6`, then `uv sync --locked`.
+    3. `uv run wsbench index --out _site_src`, with `GH_TOKEN: ${{ github.token }}`.
+    4. `actions/jekyll-build-pages@v1` (`source: _site_src`).
+    5. `actions/upload-pages-artifact@v3`.
+    6. `actions/deploy-pages@v4`, in the `github-pages` environment.
+- `index-repo/README.md`: one paragraph. The site is generated; edit it in `wafer-space/wafer.space-bench` (`site/`, `index-repo/`), not here.
 - Site:
   - `index.md` explains why the forks exist: it reuses the purpose paragraph and the namespace table from the spec.
   - It renders a table from `site.data.repos` with columns repo, upstream, strategy, state, runs, tapeouts and licence.
@@ -389,15 +423,79 @@ def test_real_catalog_has_unique_tags():
   - `_config.yml` sets `title: wafer.space benchmark repositories` and `theme: minima`.
 
 - [ ] **Step 1: Failing tests**
-  - `test_index_states`: `FakeGitHub` repos with default branch `about` give `laid-out`; others give `forked`; a planned repo absent from the org gives `pending`; `strategy=none` gives `no-source`.
+  - `test_index_states`: a `FakeGitHub` repo with default branch `about` and a `bench.yaml` gives `laid-out`; one without gives `created`; a planned repo absent from the org gives `pending`; `strategy=none` gives `no-source`.
+  - `test_index_reads_bench_yaml`: a laid-out repo whose `bench.yaml` lists a tapeout the catalog lacks shows that tapeout. The repo is the truth.
+  - `test_index_bad_bench_yaml_is_created_not_crash`: unparseable YAML gives `created`, and the run continues.
   - `test_index_rows_sorted_and_json_serialisable`.
   - `test_write_site_outputs`: `_data/repos.json`, `index.md` and `_config.yml` exist under `out_dir`.
 - [ ] **Step 2: Run.** Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run.** Expected: PASS. Then build locally to check it renders: `docker run --rm -v "$PWD/out:/srv/jekyll" jekyll/jekyll:4.2.2 jekyll build`. Nix/Docker only; never install Ruby on the host.
-- [ ] **Step 5: Commit** "Add index site generator".
+- [ ] **Step 3: Implement** the module, `site/` and `index-repo/`.
+- [ ] **Step 4: Run.** Expected: PASS.
+  - Build locally to check the site renders: `docker run --rm -v "$PWD/out:/srv/jekyll" jekyll/jekyll:4.2.2 jekyll build`. Use Docker only; never install Ruby on the host.
+  - actionlint passes on the new workflow.
+- [ ] **Step 5: Commit** "Add index site generator and Pages workflow".
 
-### Task 11: Cutover
+### Task 11: Sync and its scheduled workflow
+
+**Files:** Create `src/wafer_space_bench/sync.py`, `tests/test_sync.py`, `.github/workflows/sync.yml`. Modify `cli.py` to add the global option `--remote-fmt` (default `git@github.com:{full}.git`).
+
+**Interfaces:**
+- Consumes: Tasks 2–9 (`apply_layout`, `about_data`, `render_readme`, `write_about_commit`, `ensure_tags`, `retry_rate_limited`).
+- Produces:
+  - `MirrorPlan(set: dict[str, str], delete: list[str])`: bench-repo branch name → SHA.
+  - `plan_mirror(upstream: dict[str, str], current: dict[str, str]) -> MirrorPlan`. `current` is the bench repo's branches; only its `upstream/*` entries are considered. Unchanged SHAs are omitted.
+  - `sync_repo(plan, tapeouts, gh, cfg, org, *, remote_fmt, now, dry_run, log) -> str`. It returns one of:
+    - `"pending"` (not in the org);
+    - `"laid-out"` (it just ran `apply_layout`);
+    - `"upstream-missing"`;
+    - `"skipped: restore"`;
+    - `"unchanged"`;
+    - `"ok: +A ~U -D[, about][, N tags]"`;
+    - `"error: …"`.
+  - `run_sync(plans, tapeouts, gh, cfg, org, *, only, dry_run, remote_fmt, now, log, index_repo="wafer-space-bench/wafer-space-bench.github.io") -> int`. It returns the number of failed repos. If anything changed and it is not a dry run, it calls `gh.dispatch(index_repo, "bench-updated")` once at the end.
+  - CLI: `wsbench sync [--only NAME ...] [--dry-run]`. The exit code is 1 if any repo failed.
+- How mirroring works:
+  - `fork`: `gh.list_branches(current_name)` against `gh.list_branches(bench repo)`. Apply `delete_ref` for every delete first, then `set_ref`. No clone.
+  - `copy`: `git fetch --prune` from the upstream URL into the bare mirror `cfg.work_dir/mirrors/<bench name>.git`, then push `+refs/heads/<b>:refs/heads/upstream/<b>` plus a delete refspec per removed branch. GitLab copies work the same way.
+  - `about`: fetch only `refs/heads/about` from the bench repo into that bare repo, then call `write_about_commit`. Push only when it returns a new SHA.
+- `.github/workflows/sync.yml`:
+  - Triggers: `schedule` (`cron: "17 3 * * *"`); `workflow_dispatch` with inputs `only` (string, default empty) and `dry_run` (boolean, default false).
+  - Concurrency: group `sync`, `cancel-in-progress: false`. `timeout-minutes: 300`. Permissions: `contents: read`.
+  - Steps:
+    1. `actions/create-github-app-token@v2` with `app-id: ${{ vars.BENCH_APP_ID }}`, `private-key: ${{ secrets.BENCH_APP_PRIVATE_KEY }}`, `owner: wafer-space-bench`.
+    2. Checkout, `astral-sh/setup-uv@v6`, `uv sync --locked`.
+    3. `gh auth setup-git`, with `GH_TOKEN` set to the app token.
+    4. `actions/cache@v4`: path `work/mirrors`, key `mirrors-${{ github.run_id }}`, restore-keys `mirrors-`.
+    5. `uv run wsbench --remote-fmt 'https://github.com/{full}.git' sync` with the inputs, logging to `work/events.jsonl`.
+    6. `actions/upload-artifact@v4` of `work/events.jsonl` with `if: always()`.
+  - Workflow inputs reach the shell only through `env:` (no `${{ }}` inside `run:`), so a crafted `only` input cannot inject commands.
+
+- [ ] **Step 1: Failing tests** (FakeGitHub; real git for copy)
+  - `test_plan_mirror_create_update_delete`: upstream `{main: B, new: C}`, current `{upstream/main: A, upstream/old: X, about: Y, tapeout/…: Z}` gives `set={upstream/main: B, upstream/new: C}` and `delete=[upstream/old]`.
+  - `test_sync_fork_uses_refs_api`: upstream gains a branch, force-pushes `main`, and deletes a branch. Afterwards `fake.branches[bench]` has `upstream/*` matching upstream exactly, and in `fake.calls` every `delete_ref` comes before the first `set_ref`.
+  - `test_sync_never_touches_tapeout_or_dev`: `tapeout/*`, `dev/*` and tags are identical before and after, even when upstream deleted the branch the tapeout came from.
+  - `test_sync_copy_fetches_and_pushes`: the `upstream` fixture gains a commit on `main`; after sync, the remote's `upstream/main` is the new SHA.
+  - `test_sync_upstream_missing_changes_nothing`: there are no mutating calls.
+  - `test_sync_restore_skipped`.
+  - `test_sync_not_laid_out_runs_layout`: the result is `"laid-out"`, and the default branch is `about`.
+  - `test_sync_about_only_on_change`: run twice with the same `now`. The second run is `"unchanged"`, with no push and no new `about` commit.
+  - `test_sync_adds_new_tapeout_tags`: a catalog tapeout missing from the repo gets its tag and its `tapeout/*` branch.
+  - `test_sync_dry_run_changes_nothing`.
+  - `test_run_sync_continues_after_error_and_dispatches_once`: the 1st of 3 repos raises `GitHubError` on `set_ref`. The others are synced, the return value is 1, and `fake.dispatches == [(index_repo, "bench-updated")]`.
+  - `test_run_sync_no_change_no_dispatch`.
+  - `test_sync_workflow_inputs_via_env`: parse `sync.yml` with PyYAML; no `run:` string contains `${{`.
+- [ ] **Step 2: Run.** Expected: FAIL.
+- [ ] **Step 3: Implement** `sync.py`, the CLI and `sync.yml`.
+- [ ] **Step 4: Run** `uv run pytest -q`, then actionlint in Docker. Expected: PASS.
+- [ ] **Step 5: Commit** "Add sync of upstream branches and scheduled sync workflow".
+
+### Task 12: Cutover (needs Tim: creates repos, an App, secrets and public pushes)
+
+- [ ] **Step 0 (Tim):**
+  - Create the GitHub App `wafer-space-bench-bot` with the permissions in the spec's Automation section.
+  - Install it on all repos of `wafer-space-bench`.
+  - Add `BENCH_APP_ID` (variable) and `BENCH_APP_PRIVATE_KEY` (secret) to `wafer-space/wafer.space-bench`.
+  - Set the `wafer-space-bench` org Actions policy to "selected repositories": only `wafer-space-bench.github.io`.
 
 **Files:**
 - Modify: `experiments/tools/` (delete `bench_repos.py`, `bench_fork.py`, `bench_copy.py`, `bench_migrate.py`), `experiments/notes/DATA-INDEX.md`
@@ -409,11 +507,13 @@ def test_real_catalog_has_unique_tags():
 - [ ] **Step 4: Run the real operations,** in order, after the forks complete:
   - `uv run wsbench copy`;
   - `uv run wsbench layout`;
-  - `uv run wsbench index --out ../wafer-space-bench.github.io`, then push that repo and enable Pages (`gh api -X POST repos/wafer-space-bench/wafer-space-bench.github.io/pages -f build_type=legacy -f 'source[branch]=main'`).
+  - Push `index-repo/` as the content of `wafer-space-bench/wafer-space-bench.github.io`.
+  - Enable Pages with `gh api -X POST repos/wafer-space-bench/wafer-space-bench.github.io/pages -f build_type=workflow`.
+  - Run `gh workflow run pages.yml` there, then `gh workflow run sync.yml -f dry_run=true` in the tooling repo. Check both runs succeed before the first scheduled real sync.
 
   Each run's progress is logged to `work/events.jsonl` and reported every 5 minutes with an ETA.
 - [ ] **Step 5: Verify.**
   - `curl -sf https://wafer-space-bench.github.io/` returns 200.
-  - `wsbench index` shows no `forked` rows left (everything `laid-out`, `pending` only for known gaps).
+  - `wsbench index` shows no `created` rows left (everything `laid-out`, `pending` only for known gaps).
   - Spot-check 3 repos with `git ls-remote`.
 - [ ] **Step 6: Clean up `experiments`.** Delete `experiments/tools/bench_*.py`, point `DATA-INDEX.md` at the new repo, and commit "Move bench tooling to wafer-space/wafer.space-bench".
