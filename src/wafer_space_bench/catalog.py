@@ -4,7 +4,10 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
-from wafer_space_bench.naming import RUNS, parse_repo_url, tag_name
+from wafer_space_bench.naming import RUNS, RepoRef, parse_repo_url, tag_name
+
+# Host of the synthetic RepoRef that keys a design with no known repository (strategy none).
+NO_SOURCE_HOST = "none"
 
 
 @dataclass(frozen=True)
@@ -47,13 +50,22 @@ def load_designs(path: Path) -> list[Design]:
         return [Design(**{k: row[k] for k in Design.__dataclass_fields__}) for row in csv.DictReader(f)]
 
 
-def tapeouts_by_repo(designs: list[Design]) -> dict[str, list[Tapeout]]:
-    """Group tapeouts by the RepoRef.key of the catalog URL; unparseable repos are skipped."""
+def no_source_ref(d: Design) -> RepoRef:
+    """The synthetic source of a design without a parseable repo: `none/<shuttle>/<code>`,
+    so its plan has a key (`<shuttle>/<code>`, lowercased) and round-trips through the CSV."""
+    return RepoRef(NO_SOURCE_HOST, d.shuttle, d.code)
+
+
+def tapeouts_by_repo(designs: list[Design], *, include_none: bool = False) -> dict[str, list[Tapeout]]:
+    """Group tapeouts by the RepoRef.key of the catalog URL. Designs without a parseable
+    repo are skipped, or with `include_none` keyed by their `no_source_ref`."""
     out: dict[str, list[Tapeout]] = {}
     for d in designs:
         ref = parse_repo_url(d.repo)
         if ref is None:
-            continue
+            if not include_none:
+                continue
+            ref = no_source_ref(d)
         try:
             run = RUNS[d.shuttle]
         except KeyError:

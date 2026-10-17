@@ -2,16 +2,17 @@
 
 import collections
 import csv
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from wafer_space_bench.catalog import Design, load_designs
+from wafer_space_bench.catalog import Design, load_designs, no_source_ref
 from wafer_space_bench.events import EventLog
-from wafer_space_bench.github import GhCli, GitHub, NotFound
+from wafer_space_bench.github import GhCli, GitHub, NotFound, RepoInfo
 from wafer_space_bench.naming import RepoRef, bench_name, parse_repo_url
 
-Status = Literal["live", "archived", "missing", "gitlab"]
+Status = Literal["live", "archived", "missing", "gitlab", "none"]
 Strategy = Literal["fork", "copy", "restore", "none"]
 
 COLUMNS = [
@@ -40,24 +41,66 @@ class RepoPlan:
     missing_commits: list[str] = field(default_factory=list)
 
 
-def plan_repos(
-    designs: list[Design], gh: GitHub, *, org: str = "wafer-space-bench", progress=None
-) -> list[RepoPlan]:
-    """One plan per distinct source repo, sorted by `source.key`.
+def none_plan(d: Design) -> RepoPlan:
+    """The plan of a design with no known repository: reported, never created."""
+    return RepoPlan(no_source_ref(d), "", "none", "", "", 0, "none", "")
 
-    The first repo (in that order) of each fork network is forked; later ones in the same
-    network are copied. GitLab repos are copied, deleted ones restored. Errors other than
-    NotFound propagate.
+
+def _org_repos(gh: GitHub, org: str) -> tuple[dict[str, RepoInfo], dict[str, str]]:
+    """The org's repos by lowercased full name, and {lowercased network: full name} of the
+    org's forks. The list endpoint has no fork source, so each fork is read with get_repo."""
+    repos: dict[str, RepoInfo] = {}
+    forks: dict[str, str] = {}
+    for r in gh.list_repos(org):
+        if r.fork:
+            r = gh.get_repo(r.full_name)
+            forks.setdefault(r.network.lower(), r.full_name)
+        repos[r.full_name.lower()] = r
+    return repos, forks
+
+
+def plan_repos(
+    designs: list[Design],
+    gh: GitHub,
+    *,
+    org: str = "wafer-space-bench",
+    progress=None,
+    log: Callable[..., None] | None = None,
+) -> list[RepoPlan]:
+    """One plan per distinct source repo, sorted by `source.key`, then one `none` plan per
+    design without a parseable repo (sorted by its key).
+
+    What the org already holds wins: a bench repo that exists under the old or the current
+    `bench_name` (any case) keeps its name, an upstream rename is only logged (`rename`),
+    and the org's existing fork of a network stays that network's fork. Otherwise the first
+    repo (by key) of each fork network is forked and later ones are copied; an existing
+    plain repo stays a copy. GitLab repos are copied, deleted ones restored. Errors other
+    than NotFound propagate.
     """
+    if log is None:
+        log = lambda event, **fields: None
     repos: dict[str, RepoRef] = {}
     commits: dict[str, set[str]] = collections.defaultdict(set)
+    nones: list[RepoPlan] = []
     for d in designs:
         ref = parse_repo_url(d.repo)
         if ref is None:
+            nones.append(none_plan(d))
             continue
         repos.setdefault(ref.key, ref)
         if d.commit:
             commits[ref.key].add(d.commit)
+
+    in_org, org_forks = _org_repos(gh, org)
+
+    def target_for(*full_names: str) -> tuple[str, RepoInfo | None]:
+        """The existing bench repo of the first of `full_names` that has one, else the
+        bench name of the first."""
+        for full in full_names:
+            r = in_org.get(f"{org}/{bench_name(full)}".lower())
+            if r is not None:
+                return r.full_name, r
+        return f"{org}/{bench_name(full_names[0])}", None
 
     plans: list[RepoPlan] = []
     claimed: set[str] = set()
@@ -65,19 +108,29 @@ def plan_repos(
     for i, key in enumerate(keys, 1):
         src = repos[key]
         if src.host != "github.com":
-            plans.append(RepoPlan(src, "", "gitlab", "", "", 0, "copy", f"{org}/{bench_name(src.full_name)}"))
+            target, _ = target_for(src.full_name)
+            plans.append(RepoPlan(src, "", "gitlab", "", "", 0, "copy", target))
         else:
             try:
                 info = gh.get_repo(src.full_name)
             except NotFound:
-                plans.append(
-                    RepoPlan(src, "", "missing", "", "", 0, "restore", f"{org}/{bench_name(src.full_name)}")
-                )
+                target, _ = target_for(src.full_name)
+                plans.append(RepoPlan(src, "", "missing", "", "", 0, "restore", target))
             else:
                 missing = [c for c in sorted(commits[key]) if gh.resolve_commit(info.full_name, c) is None]
+                target, existing = target_for(info.full_name, src.full_name)
+                if existing is not None and target.lower() != f"{org}/{bench_name(info.full_name)}".lower():
+                    log("rename", source=src.full_name, current=info.full_name, target=target)
                 net = info.network.lower()
-                strategy: Strategy = "copy" if net in claimed else "fork"
-                claimed.add(net)
+                strategy: Strategy
+                if net in org_forks:
+                    strategy = "fork" if org_forks[net].lower() == target.lower() else "copy"
+                elif existing is not None and not existing.fork:
+                    strategy = "copy"
+                else:
+                    strategy = "copy" if net in claimed else "fork"
+                if strategy == "fork":
+                    claimed.add(net)
                 plans.append(
                     RepoPlan(
                         src,
@@ -87,13 +140,13 @@ def plan_repos(
                         info.default_branch,
                         info.size_kb,
                         strategy,
-                        f"{org}/{bench_name(info.full_name)}",
+                        target,
                         missing,
                     )
                 )
         if progress and (i % 25 == 0 or i == len(keys)):
             progress(i, len(keys))
-    return plans
+    return plans + sorted(nones, key=lambda p: p.source.key)
 
 
 def write_plans(path: Path, plans: list[RepoPlan]) -> None:
@@ -137,12 +190,22 @@ def read_plans(path: Path) -> list[RepoPlan]:
 
 def _scan(args) -> int:
     designs = load_designs(args.catalog)
+    events = EventLog(args.log)
+
+    def log(event: str, **fields) -> None:
+        events.write(event, **fields)
+        print(event, *(f"{k}={v}" for k, v in fields.items()), flush=True)
+
     plans = plan_repos(
-        designs, GhCli(), org=args.org, progress=lambda n, m: print(f"scanned {n}/{m}", flush=True)
+        designs,
+        GhCli(),
+        org=args.org,
+        progress=lambda n, m: print(f"scanned {n}/{m}", flush=True),
+        log=log,
     )
     write_plans(args.plans, plans)
     counts = collections.Counter(f"{p.status}/{p.strategy}" for p in plans)
-    EventLog(args.log).write("scan", repos=len(plans), counts=dict(sorted(counts.items())))
+    events.write("scan", repos=len(plans), counts=dict(sorted(counts.items())))
     for k, n in sorted(counts.items()):
         print(f"{k}: {n}")
     return 0

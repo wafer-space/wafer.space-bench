@@ -41,7 +41,7 @@ def _runs(tags: list[tuple[str, str]]) -> list[str]:
 
 
 def _row(plan: RepoPlan, state: str) -> dict:
-    name = plan.target.split("/", 1)[1]
+    name = plan.target.partition("/")[2]
     src = plan.source
     return {
         "name": name,
@@ -56,6 +56,16 @@ def _row(plan: RepoPlan, state: str) -> dict:
         "branches": 0,
         "generated": "",
     }
+
+
+def _no_source_row(plan: RepoPlan, tapeouts: list[Tapeout]) -> dict:
+    """A design with no known repository (a `none` plan has no target): no links."""
+    row = _row(plan, "no-source")
+    if not plan.target:
+        name = next((t.project for t in tapeouts if t.project), plan.source.name)
+        row |= {"name": name, "url": "", "upstream": "", "original_upstream": ""}
+    _from_catalog(row, tapeouts)
+    return row
 
 
 def _from_catalog(row: dict, tapeouts: list[Tapeout]) -> None:
@@ -102,8 +112,7 @@ def index_rows(
     rows = []
     for p in plans:
         if p.strategy == "none":
-            row = _row(p, "no-source")
-            _from_catalog(row, tapeouts.get(p.source.key, []))
+            row = _no_source_row(p, tapeouts.get(p.source.key, []))
         else:
             repo = in_org.get(p.target.lower())
             data = None
@@ -132,7 +141,7 @@ def write_site(rows: list[dict], site_dir: Path, out_dir: Path) -> None:
 def _index(args) -> int:
     log = EventLog(args.log).write
     plans = read_plans(args.plans)
-    tapeouts = tapeouts_by_repo(load_designs(args.catalog))
+    tapeouts = tapeouts_by_repo(load_designs(args.catalog), include_none=True)
     rows = index_rows(plans, tapeouts, GhCli(), args.org, log=log)
     write_site(rows, args.site, args.out)
     counts = dict(sorted(collections.Counter(r["state"] for r in rows).items()))

@@ -159,8 +159,9 @@ def run_fork(
 
 
 def plan_matches(p: RepoPlan, only: set[str]) -> bool:
-    """True if `p` is named in `only` (lowercased bench, current or source full name)."""
-    names = {p.target.split("/", 1)[1].lower(), p.current_name.lower(), p.source.key}
+    """True if `p` is named in `only` (lowercased bench, current or source full name; a
+    `none` plan has only its source key `<shuttle>/<code>`)."""
+    names = {p.target.partition("/")[2].lower(), p.current_name.lower(), p.source.key} - {""}
     return bool(names & only)
 
 

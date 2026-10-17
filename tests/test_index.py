@@ -289,3 +289,45 @@ def test_cli_index_site_option(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # no site/ here
     assert main([*base, "index", "--site", str(SITE), "--out", str(tmp_path / "out")]) == 0
     assert (tmp_path / "out" / "_config.yml").exists()
+
+
+def test_index_shows_designs_without_repo_as_no_source():
+    from wafer_space_bench.catalog import Design, tapeouts_by_repo
+    from wafer_space_bench.scan import none_plan
+
+    d = Design("wafer.space", "ws-run1", "BRWN", "FA25 Brown", "", "", "none", "digital", "1x1")
+    gh = FakeGitHub()
+    (row,) = index_rows([none_plan(d)], tapeouts_by_repo([d], include_none=True), gh, ORG)
+    assert row["state"] == "no-source" and row["strategy"] == "none"
+    assert row["name"] == "FA25 Brown"
+    assert row["url"] == row["upstream"] == row["original_upstream"] == ""
+    assert row["tapeouts"] == ["wafer.space/ws-run1/BRWN"]
+    assert row["runs"] == ["wafer.space/ws-run1"]
+
+
+def test_site_links_only_rows_with_urls():
+    md = (SITE / "index.md").read_text()
+    assert '{% if repo.url != "" %}' in md and '{% if repo.upstream != "" %}' in md
+
+
+def test_cli_index_includes_none_rows(tmp_path, monkeypatch):
+    base = _index_cli_setup(tmp_path, monkeypatch)
+    cat = tmp_path / "designs.csv"
+    cat.write_text(
+        "pool,shuttle,code,project,repo,commit,licence,kind,size\n"
+        "wafer.space,ws-run1,BRWN,Brown,,,none,digital,1x1\n"
+    )
+    from wafer_space_bench.scan import read_plans
+
+    plans = tmp_path / "elsewhere" / "deep" / "plans.csv"
+    from wafer_space_bench.catalog import load_designs
+    from wafer_space_bench.scan import none_plan
+
+    write_plans(plans, [*read_plans(plans), none_plan(load_designs(cat)[0])])
+    monkeypatch.chdir(tmp_path)
+    assert main([*base, "index", "--site", str(SITE), "--out", str(tmp_path / "out")]) == 0
+    rows = json.loads((tmp_path / "out" / "_data" / "repos.json").read_text())
+    assert [(r["name"], r["state"], r["tapeouts"]) for r in rows] == [
+        ("a--up", "created", []),
+        ("Brown", "no-source", ["wafer.space/ws-run1/BRWN"]),
+    ]
