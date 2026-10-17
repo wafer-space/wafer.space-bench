@@ -21,9 +21,31 @@ from wafer_space_bench.events import EventLog
 from wafer_space_bench.fork import Log, plan_matches, retry_rate_limited, tag_message
 from wafer_space_bench.git import Git, GitError
 from wafer_space_bench.github import GhCli, GitHub, GitHubError, NotFound
+from wafer_space_bench.naming import COMMIT_SOURCE
 from wafer_space_bench.scan import RepoPlan, read_plans
 
 STRATEGIES = ("copy", "restore")
+
+# Tapeout tags (<org>/<run>/<slot>) are frozen: never forced, on fetch or on push (R12).
+TAPEOUT_NAMESPACES = tuple(COMMIT_SOURCE)
+# Upstream tags may move (forced); the negative refspecs keep tapeout namespaces out.
+UPSTREAM_TAG_REFSPECS = ["+refs/tags/*:refs/tags/*", *(f"^refs/tags/{o}/*" for o in TAPEOUT_NAMESPACES)]
+
+
+def _is_tapeout_tag(tag: str) -> bool:
+    return tag.split("/", 1)[0] in TAPEOUT_NAMESPACES
+
+
+def push_tags(git: Git, remote: str) -> None:
+    """Push upstream tags forced, then tapeout tags never forced (a differing remote
+    tapeout tag is rejected and raises GitError). Negative refspecs apply to a whole
+    push, and a push matching no refs fails, hence separate pushes of non-empty sets."""
+    tags = git.tags()
+    if any(not _is_tapeout_tag(t) for t in tags):
+        git.push(remote, UPSTREAM_TAG_REFSPECS)
+    spaces = sorted({t.split("/", 1)[0] for t in tags if _is_tapeout_tag(t)})
+    if spaces:
+        git.push(remote, [f"refs/tags/{o}/*:refs/tags/{o}/*" for o in spaces])
 
 
 @dataclass(frozen=True)
@@ -72,8 +94,9 @@ def _clone_or_fetch(url: str, dest: Path, target: str, log: Log) -> Git:
         return Git.clone_bare(url, dest)
     git = Git(dest)
     try:
-        git.fetch(url, ["+refs/heads/*:refs/heads/*"], prune=True)
-        git.fetch(url, ["+refs/tags/*:refs/tags/*"])  # no prune: keeps our tapeout tags
+        git.fetch(url, ["+refs/heads/*:refs/heads/*"], prune=True, no_tags=True)
+        # No prune (keeps our tapeout tags); upstream tags in tapeout namespaces are ignored.
+        git.fetch(url, UPSTREAM_TAG_REFSPECS, no_tags=True)
     except GitError as e:
         log("fetch-failed", target=target, error=str(e))
     return git
@@ -145,9 +168,7 @@ def run_copy(
         remote = remote_fmt.format(full=plan.target)
         if not laid_out:  # once laid out, the original branches live under upstream/*
             git.push(remote, ["refs/heads/*:refs/heads/*"])
-        # Forced: an upstream tag that moved must move here too. Tapeout tags never
-        # change once made (existing ones are skipped).
-        git.push(remote, ["+refs/tags/*:refs/tags/*"])
+        push_tags(git, remote)
         if laid_out:
             return done("exists (laid out)")
         return done("created+pushed" if created else "pushed")

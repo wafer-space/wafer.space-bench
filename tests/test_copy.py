@@ -333,3 +333,30 @@ def test_cli_copy_dry_run_only_and_exit_code(tmp_path, monkeypatch):
     assert main([*base, "copy", "--only", "A--One", *srcs]) == 1
     events = [json.loads(line) for line in log.read_text().splitlines()]
     assert [e["target"] for e in events if e["event"] == "copy"] == [f"{ORG}/a--one"]
+
+
+def test_remote_tapeout_tag_is_never_overwritten(tmp_path, upstream, remote):
+    _, shas = upstream
+    gh, ev, cfg = FakeGitHub(), Events(), cfg_for(tmp_path)
+    tos = {"a/upstream": [tapeout(shas["ttgf0p2"])]}
+    run_copy(copy_plan(), tos, gh, cfg, ORG, remote, log=ev)
+    subprocess.run(["git", "tag", "-f", TAG, shas["main"]], cwd=tmp_path / "remote.git", check=True,
+                   capture_output=True)  # fmt: skip
+    status = run_copy(copy_plan(), tos, gh, cfg, ORG, remote, log=ev)
+    assert status.startswith("error: ")
+    assert [f["status"] for e, f in ev if e == "copy"][-1] == status
+    assert Git(tmp_path / "remote.git").rev_parse(f"refs/tags/{TAG}") == shas["main"]
+
+
+def test_local_tapeout_tag_survives_upstream_same_name(tmp_path, upstream, remote):
+    path, shas = upstream
+    gh, cfg = FakeGitHub(), cfg_for(tmp_path)
+    tos = {"a/upstream": [tapeout(shas["ttgf0p2"])]}
+    run_copy(copy_plan(), tos, gh, cfg, ORG, remote, log=Events())
+    subprocess.run(["git", "tag", TAG, shas["main"]], cwd=path, check=True)
+    subprocess.run(["git", "tag", "v2", shas["main"]], cwd=path, check=True)
+    assert run_copy(copy_plan(), tos, gh, cfg, ORG, remote, log=Events()) == "pushed"
+    local = Git(tmp_path / "work" / "mirrors" / "a--upstream.git")
+    assert local.rev_parse(f"refs/tags/{TAG}") == shas["ttgf0p2"]
+    assert local.rev_parse("refs/tags/v2") == shas["main"]  # ordinary upstream tags still come
+    assert Git(tmp_path / "remote.git").rev_parse(f"refs/tags/{TAG}") == shas["ttgf0p2"]
