@@ -489,6 +489,48 @@ def test_real_catalog_has_unique_tags():
 - [ ] **Step 4: Run** `uv run pytest -q`, then actionlint in Docker. Expected: PASS.
 - [ ] **Step 5: Commit** "Add sync of upstream branches and scheduled sync workflow".
 
+### Task 13: Repository settings (runs before the Task 12 cutover)
+
+**Files:** Create `src/wafer_space_bench/settings.py`, `tests/test_settings.py`. Modify `github.py` and `tests/fakes.py` (new Protocol methods), `index.py` and `site/index.md` (row anchors), `.github/workflows/sync.yml` (a settings step per shard), and README.
+
+**Interfaces:**
+- Consumes: Tasks 2–11 (RepoPlan, tapeouts_by_repo, GitHub, retry_rate_limited, plan_matches, the shard selection from sync).
+- Produces:
+  - `DesiredSettings(repo: dict, topics: list[str], actions_enabled: bool, vulnerability_alerts: bool, ruleset: dict)`.
+  - `desired_settings(plan, tapeouts, index_url="https://wafer-space-bench.github.io") -> DesiredSettings`. This is pure; the values come from the spec's Repository settings table.
+  - `topic_for(name: str) -> str`: lowercase; anything outside `[a-z0-9-]` becomes `-`; runs of `-` collapse; trimmed to 50 chars. For example, `wafer.space` becomes `wafer-space`.
+  - `diff_settings(current, desired) -> dict[str, tuple]`, mapping each field that differs to `(current, desired)`.
+  - `apply_settings(plan, tapeouts, gh, org, *, dry_run, sleep, log) -> str`. It returns `"pending"`, `"unchanged"`, `"dry-run: <fields>"`, `"ok: <fields>"` or `"error: …"`.
+  - `run_settings(plans, tapeouts, gh, org, *, only, shard, dry_run, delay, sleep, log) -> int`, which returns the number of failures.
+  - CLI: `wsbench settings [--only …] [--shard K/N] [--dry-run] [--delay S]`.
+  - GitHub Protocol additions, each in both GhCli and FakeGitHub:
+    - `get_repo_settings(full) -> dict`, with keys `description, homepage, has_issues, has_projects, has_wiki, has_discussions, has_pull_requests` (`has_pull_requests` is None when the API doesn't report it);
+    - `update_repo(full, fields: dict)`, a PATCH;
+    - `get_topics(full) -> list[str]` and `set_topics(full, names)`;
+    - `get_actions_enabled(full) -> bool` and `set_actions_enabled(full, enabled)`;
+    - `get_vulnerability_alerts(full) -> bool` (204 means on, 404 means off) and `set_vulnerability_alerts(full, enabled)` (PUT or DELETE; also DELETE `automated-security-fixes`);
+    - `list_rulesets(full) -> list[dict]` and `put_ruleset(full, ruleset: dict)`, which creates or updates the ruleset by name.
+- Pull requests: send `has_pull_requests: false` only if `get_repo_settings` reports the key. Otherwise log `pull-requests-unsupported` once per run and leave them alone. Whether the live API supports it is verified at cutover.
+- Ruleset: target `branch` with include `refs/heads/tapeout/**`, plus a second ruleset of target `tag` with the three tapeout namespaces. Rules: `deletion`, `non_fast_forward`, `update`. Enforcement `active`, no bypass actors. Names: `bench-frozen-branches` and `bench-frozen-tags`.
+
+- [ ] **Step 1: Failing tests**
+  - `test_desired_settings_fork_copy_restore`: exact description, homepage and topics for one plan of each strategy. The description has no banned strings and is at most 350 chars.
+  - `test_topic_for_normalises`: `wafer.space` becomes `wafer-space`; also covers case, punctuation and the length cap.
+  - `test_apply_settings_only_changes_diffs`: a second run returns `"unchanged"`, and the fake records no writes.
+  - `test_apply_settings_dry_run_no_writes`.
+  - `test_apply_settings_pending_when_absent`.
+  - `test_pull_requests_left_alone_when_unsupported`.
+  - `test_frozen_rulesets_shape`: the rules, the targets, and no bypass. Creation of `tapeout/*` is still allowed: a FakeGitHub that enforces rulesets lets `set_ref` create a new `heads/tapeout/x` but refuses to move or delete it. Add ruleset enforcement to the fake for this.
+  - `test_layout_and_sync_work_under_rulesets`: rerun the end-to-end fork → copy → layout → sync scenario with the rulesets in force. No refused writes.
+  - `test_run_settings_continues_after_error`.
+  - `test_index_rows_have_anchor_ids`.
+  - `test_sync_workflow_runs_settings`: each shard job runs `wsbench settings --shard` after sync, with inputs passed via env.
+  - GhCli argument tests for each new method, mirroring the existing ones.
+- [ ] **Step 2: Run.** Expected: FAIL.
+- [ ] **Step 3: Implement.** Wrap every write in `retry_rate_limited`. Pace with `delay` (default 1 s) after repos that changed.
+- [ ] **Step 4: Run** `uv run pytest -q`, ruff, and actionlint in Docker. Expected: PASS.
+- [ ] **Step 5: Commit** "Add repository settings command".
+
 ### Task 12: Cutover (needs Tim: creates repos, an App, secrets and public pushes)
 
 - [ ] **Step 0 (Tim):**
@@ -507,6 +549,7 @@ def test_real_catalog_has_unique_tags():
 - [ ] **Step 4: Run the real operations,** in order, after the forks complete:
   - `uv run wsbench copy`;
   - `uv run wsbench layout`;
+  - `uv run wsbench settings --dry-run --only <3 repos>`, check the diffs, then `uv run wsbench settings`. Confirm on one repo whether the API accepted `has_pull_requests` (log `pull-requests-unsupported` otherwise).
   - Push `index-repo/` as the content of `wafer-space-bench/wafer-space-bench.github.io`.
   - Enable Pages with `gh api -X POST repos/wafer-space-bench/wafer-space-bench.github.io/pages -f build_type=workflow`.
   - Run `gh workflow run pages.yml` there, then `gh workflow run sync.yml -f dry_run=true` in the tooling repo. Check both runs succeed before the first scheduled real sync.

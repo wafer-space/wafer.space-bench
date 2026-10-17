@@ -128,6 +128,28 @@ with `actions/create-github-app-token` (`owner: wafer-space-bench`) and runs
 index repo). Otherwise every mirrored branch push would run the upstream
 designs' CI in our org.
 
+## Repository settings (`wsbench settings`)
+
+The bench repos are archival mirrors, not places for collaboration. One idempotent
+command brings every bench repo to the settings below. It reads the current
+state, changes only what differs, supports `--dry-run`, and also runs daily
+as part of `sync.yml` so newly created repos are fixed automatically.
+
+| Setting | Value | Why |
+|---|---|---|
+| Issues, Projects, Wiki, Discussions | off | Reports belong upstream or in the tooling repo |
+| Pull requests | off where the API allows it; otherwise left alone and reported | Same; changes go through `dev/*` by the bench team |
+| Description | `Benchmark copy of <upstream URL>: <N> tapeout(s) on <runs>` (≤ 350 chars), or `… (upstream deleted)` for restores | Says what the repo is at a glance |
+| Homepage | `https://wafer-space-bench.github.io/#<repo name>` (the index row) | Links back to the index |
+| Topics | `wafer-space-bench`, `gf180mcu`, `open-silicon`, the strategy (`fork`, `copy` or `restore`), the tapeout org (`wafer-space`, `google` or `tinytapeout`) and each run (`ws-run1`, `gf180mcu-mpw0`, `ttgf0p2`, …) | Makes the org searchable and filterable |
+| Actions | disabled for the repo | Belt and braces with the org policy; mirrored upstream CI never runs |
+| Dependabot alerts and security updates | off | Mirrors of frozen tapeout code; avoids alert noise and bot PRs |
+| Ruleset `bench-frozen` | blocks update, deletion and force-push of `refs/heads/tapeout/**` and of tags `refs/tags/wafer.space/**`, `refs/tags/google/**`, `refs/tags/tinytapeout/**`; creation stays allowed | Enforces "frozen" on GitHub itself, with no bypass for anyone, including the App |
+| Forking | left allowed | Others may build on the bench repos |
+
+The index gives each row an anchor `id` equal to the repo name so the homepage link lands on it.
+Every published string obeys the privacy rule.
+
 ## Privacy rule
 
 **Nothing committed to the public repos, and nothing published (tag messages,
