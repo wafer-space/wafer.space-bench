@@ -9,7 +9,7 @@ from test_privacy import BANNED
 from wafer_space_bench.catalog import Tapeout
 from wafer_space_bench.cli import main
 from wafer_space_bench.config import LocalConfig, load_config, resolve_clone_url
-from wafer_space_bench.copy import RestoreSource, copy_description, restore_sources, run_copy
+from wafer_space_bench.copy import RestoreSource, copy_description, restore_sources, run_copies, run_copy
 from wafer_space_bench.git import Git
 from wafer_space_bench.naming import RepoRef
 from wafer_space_bench.scan import RepoPlan, write_plans
@@ -71,7 +71,7 @@ def test_copy_pushes_branches_and_tags(tmp_path, upstream, remote):
     gh, ev = FakeGitHub(), Events()
     tos = {"a/upstream": [tapeout(shas["ttgf0p2"]), tapeout("c" * 40, slot="gone"), tapeout("", slot="e")]}
     status = run_copy(copy_plan(), tos, gh, cfg_for(tmp_path), ORG, remote, log=ev)
-    assert status == "pushed"
+    assert status == "created+pushed"
     heads, tags = remote_refs(tmp_path)
     assert heads == ["feature/x", "main", "ttgf0p2"]
     assert tags == [TAG]
@@ -83,7 +83,7 @@ def test_copy_pushes_branches_and_tags(tmp_path, upstream, remote):
     missing = [f["tag"] for e, f in ev if e == "missing-commit"]
     assert missing == ["tinytapeout/ttgf0p2/gone", "tinytapeout/ttgf0p2/e"]
     (ce,) = [f for e, f in ev if e == "copy"]
-    assert ce["status"] == "pushed" and ce["from"] == "local mirror"
+    assert ce["status"] == "created+pushed" and ce["from"] == "local mirror"
     assert str(tmp_path) not in json.dumps(ev)
     # local bare clone lives under work_dir/mirrors
     assert (tmp_path / "work" / "mirrors" / "a--upstream.git").is_dir()
@@ -106,7 +106,7 @@ def test_copy_idempotent(tmp_path, upstream, remote):
     gh = FakeGitHub()
     tos = {"a/upstream": [tapeout(shas["ttgf0p2"])]}
     cfg = cfg_for(tmp_path)
-    assert run_copy(copy_plan(), tos, gh, cfg, ORG, remote, log=Events()) == "pushed"
+    assert run_copy(copy_plan(), tos, gh, cfg, ORG, remote, log=Events()) == "created+pushed"
     first = remote_refs(tmp_path)
     assert run_copy(copy_plan(), tos, gh, cfg, ORG, remote, log=Events()) == "pushed"
     assert remote_refs(tmp_path) == first
@@ -129,7 +129,7 @@ def test_copy_create_repo_backs_off(tmp_path, upstream, remote):
     gh, sleeps, ev = FakeGitHub(), Sleeps(), Events()
     gh.rate_limit_next(2)
     status = run_copy(copy_plan(), {}, gh, cfg_for(tmp_path), ORG, remote, log=ev, sleep=sleeps)
-    assert status == "pushed" and sleeps == [60, 120]
+    assert status == "created+pushed" and sleeps == [60, 120]
     assert [e for e, _ in ev].count("backoff") == 2
 
 
@@ -231,13 +231,56 @@ def test_restore_from_restore_source(tmp_path, upstream, remote):
     path, shas = upstream
     gh = FakeGitHub()
     p = copy_plan("gone", "repo", strategy="restore")
-    src = {"gone/repo": RestoreSource("https://foss-eda-tools.googlesource.com/s/slot-001", "the slot")}
+    slot = "https://foss-eda-tools.googlesource.com/s/slot-001"
+    src = {"gone/repo": RestoreSource(slot, f"the shuttle slot repository {slot}")}
     (tmp_path / "gs" / "s").mkdir(parents=True)
     path.rename(tmp_path / "gs" / "s" / "slot-001")
     cfg = LocalConfig(tmp_path / "work", {"https://foss-eda-tools.googlesource.com/": tmp_path / "gs"})
     tos = {"gone/repo": [tapeout(shas["main"])]}
-    assert run_copy(p, tos, gh, cfg, ORG, remote, log=Events(), sources=src) == "pushed"
+    assert run_copy(p, tos, gh, cfg, ORG, remote, log=Events(), sources=src) == "created+pushed"
     assert remote_refs(tmp_path)[1] == [TAG]
+    msg = subprocess.run(
+        ["git", "tag", "-l", "--format=%(contents)", TAG], cwd=tmp_path / "remote.git", capture_output=True,
+        text=True, check=True,
+    ).stdout  # fmt: skip
+    assert (
+        "Source: https://github.com/gone/repo (upstream repository was deleted; "
+        f"copied from the shuttle slot repository {slot})\n"
+    ) in msg
+
+
+def test_restore_keeps_existing_clone_when_fetch_fails(tmp_path, upstream, remote):
+    path, _ = upstream
+    gh, ev = FakeGitHub(), Events()
+    p = copy_plan("gone", "repo", strategy="restore")
+    src = {"gone/repo": RestoreSource(path.as_uri(), "d")}
+    cfg = LocalConfig(tmp_path / "work", {})
+    assert run_copy(p, {}, gh, cfg, ORG, remote, log=ev, sources=src) == "created+pushed"
+    path.rename(tmp_path / "moved")
+    assert run_copy(p, {}, gh, cfg, ORG, remote, log=ev, sources=src) == "pushed"
+    (ff,) = [f for e, f in ev if e == "fetch-failed"]
+    assert ff["target"] == f"{ORG}/gone--repo" and str(tmp_path) not in json.dumps(ff)
+
+
+def test_copy_follows_moved_upstream_tag(tmp_path, upstream, remote):
+    path, shas = upstream
+    gh, cfg = FakeGitHub(), cfg_for(tmp_path)
+    subprocess.run(["git", "tag", "v1", shas["main"]], cwd=path, check=True)
+    run_copy(copy_plan(), {}, gh, cfg, ORG, remote, log=Events())
+    subprocess.run(["git", "tag", "-f", "v1", shas["feature/x"]], cwd=path, check=True, capture_output=True)
+    assert run_copy(copy_plan(), {}, gh, cfg, ORG, remote, log=Events()) == "pushed"
+    assert Git(tmp_path / "remote.git").rev_parse("refs/tags/v1") == shas["feature/x"]
+
+
+def test_run_copies_paces_repo_creations(tmp_path, upstream, remote):
+    gh, sleeps = FakeGitHub(), Sleeps()
+    plans = [copy_plan(), copy_plan("gone", "repo", strategy="restore")]
+    kw = {"log": Events(), "sources": {}, "sleep": sleeps}
+    assert run_copies(plans, {}, gh, cfg_for(tmp_path), ORG, remote, **kw) == 0
+    assert sleeps == [20]  # after the one created repo only
+    sleeps.clear()
+    assert run_copies(plans, {}, gh, cfg_for(tmp_path), ORG, remote, delay=5, **kw) == 0
+    assert sleeps == []  # nothing created
 
 
 def test_restore_sources_file():

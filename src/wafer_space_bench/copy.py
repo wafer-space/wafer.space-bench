@@ -65,12 +65,17 @@ def local_clone_path(cfg: LocalConfig, target: str) -> Path:
     return cfg.work_dir / "mirrors" / f"{target.split('/', 1)[1]}.git"
 
 
-def _clone_or_fetch(url: str, dest: Path) -> Git:
+def _clone_or_fetch(url: str, dest: Path, target: str, log: Log) -> Git:
+    """Clone `url` into `dest`, or refresh an existing clone. A failed first clone raises
+    GitError; a failed refresh logs `fetch-failed` and keeps the existing clone."""
     if not dest.exists():
         return Git.clone_bare(url, dest)
     git = Git(dest)
-    git.fetch(url, ["+refs/heads/*:refs/heads/*"], prune=True)
-    git.fetch(url, ["refs/tags/*:refs/tags/*"])  # no prune: keeps our tapeout tags
+    try:
+        git.fetch(url, ["+refs/heads/*:refs/heads/*"], prune=True)
+        git.fetch(url, ["+refs/tags/*:refs/tags/*"])  # no prune: keeps our tapeout tags
+    except GitError as e:
+        log("fetch-failed", target=target, error=str(e))
     return git
 
 
@@ -100,7 +105,7 @@ def run_copy(
     sleep: Callable[[float], None] = time.sleep,
 ) -> str:
     """Copy one copy/restore plan into the org. Logs one `copy` event; returns its status:
-    "pushed", "exists (laid out)", "no source", "dry-run: <public|local mirror>" or "error: ..."."""
+    "created+pushed" (the repo was created), "pushed", "exists (laid out)", "no source", "dry-run: <public|local mirror>" or "error: ..."."""
     if plan.strategy not in STRATEGIES:
         raise ValueError(f"run_copy handles copy/restore plans, not {plan.strategy!r}")
     sources = sources or {}
@@ -121,7 +126,7 @@ def run_copy(
         why += f"; copied from {src.description}"
     try:
         try:
-            git = _clone_or_fetch(url, local_clone_path(cfg, plan.target))
+            git = _clone_or_fetch(url, local_clone_path(cfg, plan.target), plan.target, log)
         except GitError:
             if plan.strategy == "restore":
                 return done("no source")
@@ -129,39 +134,73 @@ def run_copy(
         _tag_tapeouts(git, plan, tapeouts.get(plan.source.key, []), why, log)
         try:
             laid_out = gh.get_repo(plan.target).default_branch == "about"
+            created = False
         except NotFound:
             name = plan.target.split("/", 1)[1]
             description = copy_description(plan)
             retry_rate_limited(
                 lambda: gh.create_repo(org, name, description), sleep=sleep, log=log, target=plan.target
             )
-            laid_out = False
+            laid_out, created = False, True
         remote = remote_fmt.format(full=plan.target)
         if not laid_out:  # once laid out, the original branches live under upstream/*
             git.push(remote, ["refs/heads/*:refs/heads/*"])
-        git.push(remote, ["refs/tags/*:refs/tags/*"])
-        return done("exists (laid out)" if laid_out else "pushed")
+        # Forced: an upstream tag that moved must move here too. Tapeout tags never
+        # change once made (existing ones are skipped).
+        git.push(remote, ["+refs/tags/*:refs/tags/*"])
+        if laid_out:
+            return done("exists (laid out)")
+        return done("created+pushed" if created else "pushed")
     except (GitError, GitHubError) as e:
         return done(f"error: {e}")
 
 
+def run_copies(
+    plans: list[RepoPlan],
+    tapeouts: dict[str, list[Tapeout]],
+    gh: GitHub,
+    cfg: LocalConfig,
+    org: str,
+    remote_fmt: str = "git@github.com:{full}.git",
+    *,
+    log: Log,
+    sources: dict[str, RestoreSource] | None = None,
+    dry_run: bool = False,
+    delay: float = 20,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """run_copy every copy/restore plan, sleeping `delay` after each created repo.
+    Returns the number of plans that ended in an error."""
+    todo = [p for p in plans if p.strategy in STRATEGIES]
+    failed = 0
+    for i, p in enumerate(todo, 1):
+        status = run_copy(
+            p, tapeouts, gh, cfg, org, remote_fmt, log=log, sources=sources, dry_run=dry_run, sleep=sleep
+        )
+        print(f"{i}/{len(todo)} {p.target}: {status}", flush=True)
+        failed += status.startswith("error:")
+        if status == "created+pushed":
+            sleep(delay)
+    return failed
+
+
 def _copy(args) -> int:
-    plans = [p for p in read_plans(args.plans) if p.strategy in STRATEGIES]
+    plans = read_plans(args.plans)
     if args.only:
         only = {o.lower() for o in args.only}
         plans = [p for p in plans if plan_matches(p, only)]
-    tapeouts = tapeouts_by_repo(load_designs(args.catalog))
-    cfg = load_config(args.config)
-    sources = restore_sources(args.restore_sources)
-    log = EventLog(args.log).write
-    gh = GhCli()
-    failed = 0
-    for i, p in enumerate(plans, 1):
-        status = run_copy(
-            p, tapeouts, gh, cfg, args.org, args.remote_fmt, log=log, sources=sources, dry_run=args.dry_run
-        )
-        print(f"{i}/{len(plans)} {p.target}: {status}", flush=True)
-        failed += status.startswith("error:")
+    failed = run_copies(
+        plans,
+        tapeouts_by_repo(load_designs(args.catalog)),
+        GhCli(),
+        load_config(args.config),
+        args.org,
+        args.remote_fmt,
+        log=EventLog(args.log).write,
+        sources=restore_sources(args.restore_sources),
+        dry_run=args.dry_run,
+        delay=args.delay,
+    )
     return 1 if failed else 0
 
 
@@ -171,6 +210,7 @@ def add_subcommand(subparsers) -> None:
         "--only", nargs="+", metavar="NAME", help="only these repos (bench, current or source name)"
     )
     p.add_argument("--dry-run", action="store_true", help="only log what would be done")
+    p.add_argument("--delay", type=float, default=20, help="seconds to wait after each created repo")
     p.add_argument(
         "--restore-sources",
         type=Path,

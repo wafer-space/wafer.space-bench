@@ -2,7 +2,7 @@ import subprocess
 
 import pytest
 
-from wafer_space_bench.git import IDENTITY, Git, GitError
+from wafer_space_bench.git import IDENTITY, Git, GitError, git_env
 
 
 def ls_tree(path, ref, *args):
@@ -76,3 +76,54 @@ def test_clone_missing_fails_fast(tmp_path):
     with pytest.raises(GitError):
         Git.clone_bare((tmp_path / "missing").as_uri(), tmp_path / "c.git")
     assert not (tmp_path / "c.git").exists()
+
+
+def test_git_error_redacts_paths(tmp_path):
+    with pytest.raises(GitError) as e:
+        Git.clone_bare((tmp_path / "missing").as_uri(), tmp_path / "c.git")
+    assert str(tmp_path) not in str(e.value) and "<arg>" in str(e.value)
+    g = Git.init_bare(tmp_path / "r.git")
+    with pytest.raises(GitError) as e:
+        g.fetch(str(tmp_path / "missing2"), ["+refs/heads/*:refs/heads/*"])
+    assert str(tmp_path) not in str(e.value)
+
+
+def test_fetch_no_tags(tmp_path, upstream):
+    path, shas = upstream
+    subprocess.run(["git", "tag", "v1", shas["main"]], cwd=path, check=True)
+    g = Git.init_bare(tmp_path / "e.git")
+    g.fetch(str(path), ["+refs/heads/*:refs/heads/*"], no_tags=True)
+    assert g.tags() == [] and "main" in g.heads()
+    g.fetch(str(path), ["+refs/heads/*:refs/heads/*"])
+    assert g.tags() == ["v1"]  # auto-followed without no_tags
+
+
+def test_identity_not_overridden_by_env(tmp_path, monkeypatch):
+    for v in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
+        monkeypatch.setenv(v, "Someone")
+    for v in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(v, "x@example.com")
+    g = Git.init_bare(tmp_path / "r.git")
+    c = g.commit_tree(g.mktree({"a": g.hash_blob("a")}), [], "m")
+    who = subprocess.run(
+        ["git", "log", "-1", "--format=%an <%ae>|%cn <%ce>", c], cwd=g.path, capture_output=True, text=True,
+        check=True,
+    ).stdout.strip()  # fmt: skip
+    assert who == f"{IDENTITY}|{IDENTITY}"
+
+
+def test_git_env_batch_ssh(monkeypatch):
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    env = git_env()
+    assert env["GIT_SSH_COMMAND"] == "ssh -o BatchMode=yes" and env["GIT_TERMINAL_PROMPT"] == "0"
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i key")
+    assert git_env()["GIT_SSH_COMMAND"] == "ssh -i key"
+
+
+def test_non_utf8_output_does_not_raise(tmp_path, upstream):
+    path, shas = upstream
+    g = Git.clone_bare(str(path), tmp_path / "c.git")
+    subprocess.run(
+        [b"git", b"update-ref", b"refs/heads/caf\xe9", shas["main"].encode()], cwd=g.path, check=True
+    )
+    assert len(g.heads()) == 4

@@ -7,6 +7,7 @@ fast instead of asking for credentials. Commits and tags are made as IDENTITY.
 import os
 import subprocess
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 NAME = "wafer-space-bench"
 EMAIL = "bench@wafer.space"
@@ -24,15 +25,49 @@ class GitError(RuntimeError):
     """A git command failed. The message holds the git subcommand and stderr (truncated)."""
 
 
+def git_env() -> dict[str, str]:
+    """The environment for every git call: never prompt, and always commit as IDENTITY."""
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_AUTHOR_NAME": NAME,
+        "GIT_AUTHOR_EMAIL": EMAIL,
+        "GIT_COMMITTER_NAME": NAME,
+        "GIT_COMMITTER_EMAIL": EMAIL,
+    }
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    return env
+
+
+def _redactions(args: list[str], cwd: Path | None) -> list[str]:
+    """Non-option arguments containing `/` (paths, URLs, refs) and the repo path, longest first; for a
+    file:// URL also its plain path, which is how git reports it."""
+    out = [a for a in args[1:] if "/" in a and not a.startswith("-")]
+    out += [unquote(urlparse(a).path) for a in out if a.startswith("file://")]
+    if cwd is not None:
+        out += [str(cwd), str(Path(cwd).resolve())]
+    return sorted({a for a in out if a}, key=len, reverse=True)
+
+
 def _run(args: list[str], cwd: Path | None = None, stdin: str | None = None, check: bool = True) -> str:
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     p = subprocess.run(
-        ["git", *_CONFIG, *args], cwd=cwd, input=stdin, capture_output=True, text=True, env=env, check=False
+        ["git", *_CONFIG, *args],
+        cwd=cwd,
+        input=stdin,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        env=git_env(),
+        check=False,
     )
     if check and p.returncode != 0:
-        # Only the subcommand and its options: other arguments may be local paths.
+        # Only the subcommand and its options; arguments (local paths, URLs) are redacted
+        # from stderr too, since error text can end up in shared event logs.
         shown = " ".join([args[0], *(a for a in args[1:] if a.startswith("-"))])
-        raise GitError(f"git {shown}: {(p.stderr or '').strip()}"[:300])
+        err = (p.stderr or "").strip()
+        for a in _redactions(args, cwd):
+            err = err.replace(a, "<arg>")
+        raise GitError(f"git {shown}: {err}"[:300])
     return p.stdout if p.returncode == 0 else ""
 
 
@@ -82,7 +117,8 @@ class Git:
         return self._git("hash-object", "-w", "--stdin", stdin=text).strip()
 
     def mktree(self, entries: dict[str, str]) -> str:
-        """A tree from {path: blob sha}; paths may contain `/` (subtrees are built)."""
+        """A tree from {path: blob sha}. Every entry is a regular file (mode 100644): no
+        executables, symlinks or submodules. Paths may contain `/`; subtrees are built."""
         blobs: dict[str, str] = {}
         subdirs: dict[str, dict[str, str]] = {}
         for path, sha in entries.items():
@@ -105,8 +141,10 @@ class Git:
         """An annotated tag `name` on commit `target`."""
         self._git("tag", "-a", name, "-m", message, target)
 
-    def fetch(self, remote: str, refspecs: list[str], *, prune: bool = False) -> None:
-        self._git("fetch", "--quiet", *(["--prune"] if prune else []), remote, *refspecs)
+    def fetch(self, remote: str, refspecs: list[str], *, prune: bool = False, no_tags: bool = False) -> None:
+        opts = ["--prune"] if prune else []
+        opts += ["--no-tags"] if no_tags else []
+        self._git("fetch", "--quiet", *opts, remote, *refspecs)
 
     def push(self, remote: str, refspecs: list[str]) -> None:
         self._git("push", "--quiet", remote, *refspecs)
