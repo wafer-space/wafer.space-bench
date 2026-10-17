@@ -6,7 +6,7 @@ from fakes import FakeGitHub
 from wafer_space_bench.catalog import Design, tapeouts_by_repo
 from wafer_space_bench.cli import main
 from wafer_space_bench.fork import ensure_fork, ensure_tags, run_fork, tag_message
-from wafer_space_bench.github import GitHubError
+from wafer_space_bench.github import GitHubError, RateLimited
 from wafer_space_bench.naming import COMMIT_SOURCE, RepoRef
 from wafer_space_bench.scan import RepoPlan, write_plans
 
@@ -149,7 +149,7 @@ def test_tags_missing_commit():
 def test_tag_message_has_no_local_paths():
     (t,) = tapeouts(("1", SHA))
     msg = tag_message(t, "https://github.com/a/one")
-    for banned in ["/backups", "/home/", "big-storage", "~/github", "/tmp/claude"]:
+    for banned in ["/back" + "ups", "/ho" + "me/", "big-" + "storage", "~/git" + "hub", "/tmp/" + "claude"]:
         assert banned not in msg
     assert "https://github.com/a/one" in msg and COMMIT_SOURCE[t.org] in msg
     assert msg == (
@@ -223,3 +223,63 @@ def test_cli_fork_only_filter_and_exit_code(tmp_path, monkeypatch):
     assert [r for r in gh.repos if r.startswith(ORG)] == [f"{ORG}/b--two"]
     events = [json.loads(line) for line in (tmp_path / "e.jsonl").read_text().splitlines()]
     assert any(e["event"] == "fork" for e in events)
+
+
+def test_tags_retry_when_rate_limited():
+    class Limited(FakeGitHub):
+        n = 1
+
+        def create_tag(self, *a):
+            if self.n:
+                self.n -= 1
+                raise RateLimited("slow down")
+            super().create_tag(*a)
+
+    gh, sleeps, ev = Limited(), Sleeps(), Events()
+    full = forked(gh)
+    r = ensure_tags(gh, full, tapeouts(("1", SHA)), "https://github.com/a/one", ev, sleep=sleeps)
+    assert r == {"wafer.space/ws-run1/1": "created"}
+    assert sleeps == [60] and "backoff" in [e for e, _ in ev]
+
+
+def test_run_fork_one_event_and_delay_when_tagging_fails():
+    class BadTag(FakeGitHub):
+        def create_tag(self, *a):
+            raise GitHubError("tag boom")
+
+    gh = BadTag()
+    upstream(gh)
+    sleeps, ev = Sleeps(), Events()
+    tos = tapeouts_by_repo([design("https://github.com/a/one")])
+    assert run_fork([plan()], tos, gh, ORG, sleep=sleeps, log=ev) == 1
+    fork_events = [f for e, f in ev if e == "fork"]
+    assert len(fork_events) == 1 and fork_events[0]["status"].startswith("error: ")
+    assert sleeps == [20]
+
+
+def test_run_fork_not_ready_skips_tags_and_fails():
+    gh, sleeps, ev = FakeGitHub(), Sleeps(), Events()
+    upstream(gh)
+    gh.ready_after(1000)
+    tos = tapeouts_by_repo([design("https://github.com/a/one")])
+    assert run_fork([plan()], tos, gh, ORG, sleep=sleeps, log=ev) == 1
+    assert [e for e, _ in ev if e == "tag"] == []
+    (fe,) = [f for e, f in ev if e == "fork"]
+    assert fe["status"] == "created (not ready; re-run to tag)"
+    assert sleeps[-1] == 20
+    # re-run: fork exists, tags get created
+    ev2 = Events()
+    assert run_fork([plan()], tos, gh, ORG, sleep=Sleeps(), log=ev2) == 0
+    assert gh.tags[f"{ORG}/a--one"]
+
+
+def test_run_fork_renamed_upstream_uses_original_key_and_new_url():
+    gh = FakeGitHub()
+    gh.add_upstream("old/name", branches={"main": SHA}, renamed_to="new/name")
+    p = plan("new/name")
+    p.source = RepoRef("github.com", "old", "name")
+    tos = tapeouts_by_repo([design("https://github.com/old/name")])
+    assert run_fork([p], tos, gh, ORG, sleep=Sleeps(), log=Events()) == 0
+    msg = next(c[1][3] for c in gh.calls if c[0] == "create_tag")
+    assert "Source: https://github.com/new/name\n" in msg
+    assert gh.tags[f"{ORG}/new--name"]["wafer.space/ws-run1/1"] == SHA

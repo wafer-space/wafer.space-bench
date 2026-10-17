@@ -82,7 +82,13 @@ def ensure_fork(
 
 
 def ensure_tags(
-    gh: GitHub, repo_full: str, tapeouts: list[Tapeout], source_url: str, log: Log
+    gh: GitHub,
+    repo_full: str,
+    tapeouts: list[Tapeout],
+    source_url: str,
+    log: Log,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, TagStatus]:
     out: dict[str, TagStatus] = {}
     for t in tapeouts:
@@ -94,7 +100,14 @@ def ensure_tags(
             if full is None:
                 status = "missing-commit"
             else:
-                gh.create_tag(repo_full, t.tag, full, tag_message(t, source_url))
+                message = tag_message(t, source_url)
+                retry_rate_limited(
+                    lambda t=t, full=full, message=message: gh.create_tag(repo_full, t.tag, full, message),
+                    sleep=sleep,
+                    log=log,
+                    target=repo_full,
+                    tag=t.tag,
+                )
                 status = "created"
         out[t.tag] = status
         log("tag", target=repo_full, tag=t.tag, commit=t.commit, status=status)
@@ -117,16 +130,26 @@ def run_fork(
     for i, p in enumerate(todo, 1):
         n = f"{i}/{len(todo)}"
         fields = {"n": n, "source": p.current_name, "target": p.target}
+        not_ready = False
+
+        def watch(event, _log=log, **kw):
+            nonlocal not_ready
+            not_ready = not_ready or event == "fork-not-ready"
+            _log(event, **kw)
+
+        status = None
         try:
-            status = ensure_fork(gh, p, org, sleep=sleep, log=log)
-            log("fork", status=status, **fields)
-            ensure_tags(
-                gh, p.target, tapeouts.get(p.source.key, []), f"https://github.com/{p.current_name}", log
-            )
+            status = ensure_fork(gh, p, org, sleep=sleep, log=watch)
+            if not_ready:
+                failed += 1
+                log("fork", status="created (not ready; re-run to tag)", **fields)
+            else:
+                url = f"https://github.com/{p.current_name}"
+                ensure_tags(gh, p.target, tapeouts.get(p.source.key, []), url, log, sleep=sleep)
+                log("fork", status=status, **fields)
         except GitHubError as e:
             failed += 1
             log("fork", status=f"error: {e}", **fields)
-            continue
         if status == "created":
             sleep(delay)
     return failed
