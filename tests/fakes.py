@@ -12,8 +12,11 @@ Models what the tooling relies on:
 Inspection state is keyed by each repo's current full name.
 """
 
+import subprocess
 from collections.abc import Iterable
+from pathlib import Path
 
+from wafer_space_bench.git import Git
 from wafer_space_bench.github import GitHubError, NotFound, RateLimited, RepoInfo
 
 
@@ -203,3 +206,76 @@ class FakeGitHub:
     def dispatch(self, full_name: str, event_type: str) -> None:
         self._record("dispatch", full_name, event_type)
         self.dispatches.append((self._resolve(full_name), event_type))
+
+
+def sh(cwd, *args) -> str:
+    """Run git in `cwd` (with a test identity); its stripped stdout."""
+    return subprocess.run(
+        ["git", "-c", "user.name=T", "-c", "user.email=t@e", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+class SyncedFake(FakeGitHub):
+    """FakeGitHub kept consistent with real bare `file://` remotes.
+
+    Writes (`set_ref`, `delete_ref`, `set_default_branch`, `create_tag`) first copy the
+    remote's heads, tags and commits into the fake, then apply the change to both, so git
+    (`ls-remote`, fetch, the `about` push) sees exactly what the API calls did and final
+    state can be asserted on the real remote. `remote_path` is the remote of every repo not
+    given its own with `link`. Reads (`list_branches`, `get_tag`) re-sync only linked repos,
+    so a repo modelled in the fake alone (an upstream) keeps what the test gives it.
+    """
+
+    def __init__(self, remote_path: Path | None = None):
+        super().__init__()
+        self.remote = Git(remote_path) if remote_path is not None else None
+        self.remotes: dict[str, Git] = {}
+
+    def link(self, full: str, remote_path: Path) -> None:
+        self.remotes[self._resolve(full)] = Git(remote_path)
+
+    def _git_of(self, name: str) -> Git:
+        return self.remotes.get(name) or self.remote
+
+    def _sync(self, full):
+        name = self._resolve(full)
+        g = self._git_of(name)
+        self.branches[name] = {h: g.rev_parse(f"refs/heads/{h}") for h in g.heads()}
+        self.tags[name] = {t: g.rev_parse(f"refs/tags/{t}") for t in g.tags()}
+        self.add_commits(name, sh(g.path, "rev-list", "--all").split())
+
+    def _read_sync(self, full):
+        if self._resolve(full) in self.remotes:
+            self._sync(full)
+
+    def list_branches(self, full_name):
+        self._read_sync(full_name)
+        return super().list_branches(full_name)
+
+    def get_tag(self, full_name, tag):
+        self._read_sync(full_name)
+        return super().get_tag(full_name, tag)
+
+    def set_ref(self, full_name, ref, sha):
+        self._sync(full_name)
+        super().set_ref(full_name, ref, sha)
+        self._git_of(self._resolve(full_name)).update_ref(f"refs/{ref}", sha)
+
+    def delete_ref(self, full_name, ref):
+        self._sync(full_name)
+        super().delete_ref(full_name, ref)
+        self._git_of(self._resolve(full_name)).delete_ref(f"refs/{ref}")
+
+    def set_default_branch(self, full_name, branch):
+        self._sync(full_name)
+        super().set_default_branch(full_name, branch)
+        sh(self._git_of(self._resolve(full_name)).path, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
+
+    def create_tag(self, full_name, tag, sha, message):
+        self._sync(full_name)
+        super().create_tag(full_name, tag, sha, message)
+        sh(self._git_of(self._resolve(full_name)).path, "tag", "-a", tag, "-m", message, sha)

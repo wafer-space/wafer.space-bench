@@ -1,9 +1,9 @@
 """Tests for the branch layout (about, upstream/*, tapeout/*).
 
-FakeGitHub and the real git remote are kept consistent by `SyncedFake`: its `set_ref`,
-`delete_ref` and `set_default_branch` also apply the change to the bare `file://` remote
-(git update-ref / symbolic-ref), and first copy the remote's heads and commits into the
-fake. `ls-remote` and the `about` push therefore see exactly what the API calls did, and
+FakeGitHub and the real git remote are kept consistent by `SyncedFake` (tests/fakes.py):
+its `set_ref`, `delete_ref` and `set_default_branch` also apply the change to the bare
+`file://` remote (git update-ref / symbolic-ref), and first copy the remote's heads and
+commits into the fake. `ls-remote` and the `about` push therefore see exactly what the API calls did, and
 the final-state assertions are made on the real remote.
 """
 
@@ -11,7 +11,7 @@ import json
 import subprocess
 
 import yaml
-from fakes import FakeGitHub
+from fakes import SyncedFake
 
 from wafer_space_bench.catalog import Tapeout
 from wafer_space_bench.cli import main
@@ -48,32 +48,6 @@ def sh(cwd, *args):
         capture_output=True,
         text=True,
     ).stdout.strip()
-
-
-class SyncedFake(FakeGitHub):
-    def __init__(self, remote_path):
-        super().__init__()
-        self.remote = Git(remote_path)
-
-    def _sync(self, full):
-        name = self._resolve(full)
-        self.branches[name] = {h: self.remote.rev_parse(f"refs/heads/{h}") for h in self.remote.heads()}
-        self.add_commits(name, sh(self.remote.path, "rev-list", "--all").split())
-
-    def set_ref(self, full_name, ref, sha):
-        self._sync(full_name)
-        super().set_ref(full_name, ref, sha)
-        self.remote.update_ref(f"refs/{ref}", sha)
-
-    def delete_ref(self, full_name, ref):
-        self._sync(full_name)
-        super().delete_ref(full_name, ref)
-        self.remote.delete_ref(f"refs/{ref}")
-
-    def set_default_branch(self, full_name, branch):
-        self._sync(full_name)
-        super().set_default_branch(full_name, branch)
-        sh(self.remote.path, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
 
 
 def plan():

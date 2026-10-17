@@ -83,6 +83,28 @@ def _mirror_about(git: Git, remote: str, remote_has_about: bool) -> None:
         git.delete_ref(ABOUT_REF)
 
 
+def about_repo(cfg: LocalConfig, target: str, remote: str, remote_has_about: bool) -> Git:
+    """The local work repo for bench repo `target`'s `about` branch, with `about` matching
+    the remote's (absent if the remote has none)."""
+    git = _work_repo(cfg, target)
+    _mirror_about(git, remote, remote_has_about)
+    return git
+
+
+def push_about(
+    git: Git, remote: str, plan: RepoPlan, tapeouts: list[Tapeout], branches: list[str] | set[str], now: str
+) -> bool:
+    """Regenerate bench.yaml and README.md for `plan.target` with these branch names, on top
+    of the `about` that `about_repo` mirrored. Commits and pushes only when something other
+    than `generated` changed (write_about_commit); True if a commit was pushed."""
+    data = about_data(plan, tapeouts, sorted(branches), now)
+    sha = write_about_commit(git, data, render_readme(data, plan.target))
+    if sha is None:
+        return False
+    git.push(remote, [f"{sha}:{ABOUT_REF}"])
+    return True
+
+
 def _sha_conflicts(
     lp: LayoutPlan, heads: dict[str, str], tags: dict[str, str], ours_about: bool
 ) -> list[str]:
@@ -123,8 +145,7 @@ def _layout(
     tags = {r.removeprefix("refs/tags/"): s for r, s in refs.items() if r.startswith("refs/tags/")}
     lp = plan_layout(list(heads), list(tags))
 
-    git = _work_repo(cfg, target)
-    _mirror_about(git, remote, "about" in heads)
+    git = about_repo(cfg, target, remote, "about" in heads)
     if not laid_out:
         conflicts = _sha_conflicts(lp, heads, tags, git.show(ABOUT_REF, "bench.yaml") is not None)
         if conflicts:
@@ -157,10 +178,7 @@ def _layout(
         retry_rate_limited(fn, sleep=sleep, log=log, target=target, **context)
         changed = True
 
-    data = about_data(plan, tapeouts, sorted(branches), now)
-    sha = write_about_commit(git, data, render_readme(data, target))
-    if sha is not None:
-        git.push(remote, [f"{sha}:{ABOUT_REF}"])
+    if push_about(git, remote, plan, tapeouts, branches, now):
         changed = True
     moves = []
     for b, new in upstream.items():

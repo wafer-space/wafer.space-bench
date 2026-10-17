@@ -1,0 +1,71 @@
+name: Sync
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Only these repos (space-separated bench, current or source names); empty for all"
+        type: string
+        default: ""
+      dry_run:
+        description: "Only log what would change"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.BENCH_APP_ID }}
+          private-key: ${{ secrets.BENCH_APP_PRIVATE_KEY }}
+          owner: wafer-space-bench
+      - uses: actions/checkout@v4
+        with:
+          # git must authenticate with the app token (via gh), not this repo's GITHUB_TOKEN
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - name: Let git use the app token
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh auth setup-git
+      - uses: actions/cache@v4
+        with:
+          path: work/mirrors
+          key: mirrors-${{ github.run_id }}
+          restore-keys: mirrors-
+      - name: Sync
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Inputs reach the shell only as environment variables, never as ${{ }} in `run`.
+          ONLY: ${{ inputs.only }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=()
+          if [ -n "$ONLY" ]; then
+            read -ra names <<< "$ONLY"
+            args+=(--only "${names[@]}")
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          uv run wsbench --remote-fmt 'https://github.com/{full}.git' --log work/events.jsonl sync "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sync-events
+          path: work/events.jsonl
+          if-no-files-found: ignore
