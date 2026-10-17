@@ -102,8 +102,9 @@ The other three run unattended in GitHub Actions (see Automation), and can be ru
    - Actions disabled; Dependabot alerts and security updates off.
    - Rulesets `bench-frozen-branches` (`refs/heads/tapeout/**`) and `bench-frozen-tags`
      (`refs/tags/wafer.space/**`, `google/**`, `tinytapeout/**`): no update, deletion or
-     force-push, with no bypass for anyone, the App included. Creating a tapeout branch or
-     tag stays allowed, so the other commands keep working.
+     force-push for anyone but the bench App, the only bypass actor (so the tooling can
+     correct a wrong tapeout ref). Creating a tapeout branch or tag stays allowed, so the
+     other commands keep working.
 
    `--shard K/N` takes the same slices as `sync`; `--delay` (default 1 s) paces the repos
    that changed. Forking stays allowed.
