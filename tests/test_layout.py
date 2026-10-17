@@ -546,13 +546,35 @@ def test_apply_layout_deletes_only_verified_copies(tmp_path, upstream, remote):
 
 
 def mirror_snapshot(root):
-    """Every ref and every file's (mtime, size, link count) under bare repo `root`."""
-    files = {}
-    for d, _, names in os.walk(root):
-        for n in names:
+    """Every ref, and every file's and directory's (mtime, size, link count), under bare repo `root`."""
+    entries = {}
+    for d, dirs, names in os.walk(root):
+        for n in [*dirs, *names]:
             st = os.stat(os.path.join(d, n))
-            files[os.path.relpath(os.path.join(d, n), root)] = (st.st_mtime_ns, st.st_size, st.st_nlink)
-    return sh(root, "for-each-ref", "--format=%(refname) %(objectname)"), files
+            entries[os.path.relpath(os.path.join(d, n), root)] = (st.st_mtime_ns, st.st_size, st.st_nlink)
+    st = os.stat(root)
+    entries["."] = (st.st_mtime_ns, st.st_size, st.st_nlink)
+    return sh(root, "for-each-ref", "--format=%(refname) %(objectname)"), entries
+
+
+def test_apply_layout_without_mirror_fetches_bench_repo_only(tmp_path, upstream, remote, monkeypatch):
+    """No local mirror: no clone of the public upstream; an empty repo fetches the bench repo."""
+    gh, shas = setup(tmp_path, upstream, remote)
+    calls = []
+    real_run = git_module._run
+
+    def spy(args, cwd=None, **kw):
+        calls.append(args)
+        return real_run(args, cwd=cwd, **kw)
+
+    monkeypatch.setattr(git_module, "_run", spy)
+    ev = Events()
+    assert run(gh, tmp_path, remote, shas, ev=ev) == "ok: 3 upstream, 1 tapeout"
+    assert not [a for a in calls if a[0] == "clone"]
+    assert not [e for e, _ in ev if e == "seed-failed"]
+    assert not any("https://" in a for args in calls for a in args)
+    clone = local_clone_path(cfg(tmp_path), TARGET)
+    assert sh(clone, "rev-parse", "refs/bench/heads/main") == shas["main"]
 
 
 def test_apply_layout_seeds_clone_from_local_mirror_read_only(tmp_path, upstream, remote, monkeypatch):
@@ -582,7 +604,7 @@ def test_apply_layout_seeds_clone_from_local_mirror_read_only(tmp_path, upstream
     assert sh(clone, "rev-parse", f"refs/bench/tags/{TAG}^{{commit}}") == shas["ttgf0p2"]
     assert mirror_snapshot(mirror) == before
     clones = [args for cwd, args in cwds if args[0] == "clone"]
-    assert clones == [["clone", "--bare", "--quiet", "--no-hardlinks", str(mirror), str(clone)]]
+    assert clones == [["clone", "--bare", "--quiet", "--no-hardlinks", str(mirror), f"{clone}.tmp"]]
     for cwd, args in cwds:
         assert cwd is None or mirror not in (cwd, *cwd.parents), args
         assert not any(a in ("-C", "--git-dir") or a.startswith("--git-dir=") for a in args), args

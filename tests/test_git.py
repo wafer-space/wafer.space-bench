@@ -195,3 +195,21 @@ def test_clone_bare_from_local_path_copies_objects(tmp_path, upstream):
     g = Git.clone_bare(str(path), tmp_path / "c.git")
     objects = [p for p in (g.path / "objects").rglob("*") if p.is_file()]
     assert objects and all(p.stat().st_nlink == 1 for p in objects)
+
+
+def test_clone_bare_replaces_leftover_tmp_and_leaves_nothing_on_failure(tmp_path, upstream):
+    path, shas = upstream
+    dest = tmp_path / "c.git"
+    leftover = tmp_path / "c.git.tmp"
+    leftover.mkdir()
+    (leftover / "junk").write_text("partial\n")
+    g = Git.clone_bare(str(path), dest)
+    assert g.rev_parse("refs/heads/main") == shas["main"]
+    assert not leftover.exists() and not (dest / "junk").exists()
+    bad = tmp_path / "d.git"
+    with pytest.raises(GitError):
+        Git.clone_bare((tmp_path / "missing").as_uri(), bad)
+    assert not bad.exists() and not (tmp_path / "d.git.tmp").exists()
+    with pytest.raises(GitError):  # an existing repo is never cloned over
+        Git.clone_bare(str(path), dest)
+    assert Git.init_bare(dest).rev_parse("refs/heads/main") == shas["main"]  # re-init keeps refs

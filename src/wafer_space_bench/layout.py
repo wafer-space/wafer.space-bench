@@ -5,11 +5,11 @@ out: `git ls-remote` lists its refs and the layout is planned from those. The or
 `about` commit is built in a small work repo and pushed. Every other ref write is a git
 push from the repo's local bare clone (`work_dir/mirrors/<bench name>.git`, shared with
 `wsbench copy`), which has the commits: a missing clone is seeded from upstream (a local
-mirror when one exists, only ever cloned from), then the bench repo's own heads and tags
-are fetched under `refs/bench/`. One atomic push creates the new `upstream/*` and
-`tapeout/*` branches; the default branch is switched through the API; a second atomic
-push deletes the originals, each only if it and its `upstream/` copy are still where the
-listing saw them (--force-with-lease).
+mirror when one exists, only ever cloned from; else it starts empty), then the bench
+repo's own heads and tags are fetched under `refs/bench/`. One atomic push creates the
+new `upstream/*` and `tapeout/*` branches; the default branch is switched through the
+API; a second atomic push deletes the originals, each only if it and its `upstream/` copy
+are still where the listing saw them (--force-with-lease).
 
 Order matters for crash safety: `about` and every new branch exist before the default
 branch is switched, and the original branches are deleted only after the switch. A
@@ -110,14 +110,17 @@ def about_repo(cfg: LocalConfig, target: str, remote: str, remote_has_about: boo
 
 def objects_repo(cfg: LocalConfig, plan: RepoPlan, remote: str, log: Log) -> Git:
     """The local bare clone of `plan.target` holding every commit its bench repo's heads and
-    tags point at. A missing clone is seeded from upstream (a local mirror if one exists,
-    else the public URL); if that fails it starts empty and the fetch brings everything."""
+    tags point at. A missing clone is seeded from upstream's local mirror when one exists;
+    otherwise (or if that clone fails) it starts empty and the fetch brings everything, as
+    the bench repo already has every object it points at."""
     dest = local_clone_path(cfg, plan.target)
     if dest.exists():
         git = Git(dest)
     else:
+        public = public_url(plan)
+        url = resolve_clone_url(public, cfg)
         try:
-            git = Git.clone_bare(resolve_clone_url(public_url(plan), cfg), dest)
+            git = Git.clone_bare(url, dest) if url != public else Git.init_bare(dest)
         except GitError as e:
             log("seed-failed", target=plan.target, error=str(e))
             git = Git.init_bare(dest)

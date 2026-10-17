@@ -5,6 +5,7 @@ fast instead of asking for credentials. Commits and tags are made as IDENTITY.
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -73,6 +74,23 @@ def _run(args: list[str], cwd: Path | None = None, stdin: str | None = None, che
     return p.stdout if p.returncode == 0 else ""
 
 
+def _create(dest: Path, make) -> Path:
+    """Run `make(tmp)` on the sibling `<dest>.tmp` (a leftover one is removed first) and
+    rename it to `dest` once it succeeds; on failure nothing is left at either path."""
+    if dest.exists():
+        raise GitError(f"git: destination already exists: {dest.name}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        make(tmp)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    tmp.rename(dest)
+    return dest
+
+
 class Git:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -80,19 +98,22 @@ class Git:
     @classmethod
     def clone_bare(cls, url: str, dest: Path) -> "Git":
         """A bare clone of `url` at `dest`. From a local path (a mirror) objects are copied,
-        never hardlinked, so nothing in `dest` shares an inode with the source."""
-        dest = Path(dest)
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        never hardlinked, so nothing in `dest` shares an inode with the source. The clone is
+        made beside `dest` and renamed into place, so a failed clone leaves no `dest`."""
         local = ["--no-hardlinks"] if "://" not in url and Path(url).exists() else []
-        _run(["clone", "--bare", "--quiet", *local, url, str(dest)])
-        return cls(dest)
+        return cls(
+            _create(Path(dest), lambda tmp: _run(["clone", "--bare", "--quiet", *local, url, str(tmp)]))
+        )
 
     @classmethod
     def init_bare(cls, path: Path) -> "Git":
+        """An empty bare repo at `path`, made beside it and renamed into place (an existing
+        repo is re-initialised in place, which keeps its refs and objects)."""
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _run(["init", "--bare", "--quiet", str(path)])
-        return cls(path)
+        if path.exists():
+            _run(["init", "--bare", "--quiet", str(path)])
+            return cls(path)
+        return cls(_create(path, lambda tmp: _run(["init", "--bare", "--quiet", str(tmp)])))
 
     def _git(self, *args: str, stdin: str | None = None) -> str:
         return _run(list(args), cwd=self.path, stdin=stdin)
