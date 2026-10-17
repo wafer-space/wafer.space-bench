@@ -1,0 +1,19 @@
+# Deleted designer repos whose tree survives in a public shuttle slot repository.
+# Keyed by RepoRef.key (lowercased owner/name). Other deleted repos are restored only
+# from a local mirror of their original URL (see bench.local.toml.example).
+
+["0616ygh/rioschip2"]
+public_url = "https://foss-eda-tools.googlesource.com/third_party/shuttle/gf180mcu/mpw-000/slot-018"
+description = "the shuttle slot repository https://foss-eda-tools.googlesource.com/third_party/shuttle/gf180mcu/mpw-000/slot-018"
+
+["abdulmoizsheikh1/sha-256-with-clock-multiplexing"]
+public_url = "https://foss-eda-tools.googlesource.com/third_party/shuttle/gf180mcu/mpw-000/slot-032"
+description = "the shuttle slot repository https://foss-eda-tools.googlesource.com/third_party/shuttle/gf180mcu/mpw-000/slot-032"
+
+["mdagois/tiny_user_project_xls_lfsr"]
+public_url = "https://foss-eda-tools.googlesource.com/third_party/shuttle/gf180mcu/mpw-000/slot-034"
+description = "the shuttle slot repository https://foss-eda-tools.googlesource.com/third_party/shuttle/gf180mcu/mpw-000/slot-034"
+
+["ashbir/sensor-harness-gf180"]
+public_url = "https://foss-eda-tools.googlesource.com/third_party/shuttle/gf180mcu/mpw-18h1/slot-004"
+description = "the shuttle slot repository https://foss-eda-tools.googlesource.com/third_party/shuttle/gf180mcu/mpw-18h1/slot-004"

@@ -1,0 +1,147 @@
+name: Sync
+
+# Sharded (ruling R14): an App installation token lasts 60 minutes, so the plans are split
+# into 8 shards (by a stable hash of the bench repo name), each a job that mints its own
+# token and must finish within 60 minutes. Shards do not dispatch the index themselves:
+# each one that changed something puts a `changed` marker in its artifact, and the
+# `notify` job dispatches `bench-updated` to the index repo once for the whole run.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Only these repos (space-separated bench, current or source names); empty for all"
+        type: string
+        default: ""
+      dry_run:
+        description: "Only log what would change"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.BENCH_APP_ID }}
+          private-key: ${{ secrets.BENCH_APP_PRIVATE_KEY }}
+          owner: wafer-space-bench
+      - uses: actions/checkout@v4
+        with:
+          # git must authenticate with the app token (via gh), not this repo's GITHUB_TOKEN
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - run: uv sync --locked
+      - name: Let git use the app token
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh auth setup-git
+      - uses: actions/cache/restore@v4
+        with:
+          path: work/mirrors
+          key: mirrors-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: mirrors-${{ matrix.shard }}-
+      - name: Sync
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Inputs reach the shell only as environment variables, never as ${{ }} in `run`.
+          ONLY: ${{ inputs.only }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          mkdir -p work/mirrors
+          args=(--shard "$SHARD/8" --no-dispatch --changed-file work/changed)
+          read -ra names <<< "$ONLY"
+          if [ "${#names[@]}" -gt 0 ]; then
+            args+=(--only "${names[@]}")
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          uv run wsbench --remote-fmt 'https://github.com/{full}.git' --log work/events.jsonl sync "${args[@]}"
+      # Runs even when sync failed for some repo (settings do not depend on the branches,
+      # and a repo created since the last run gets its settings and frozen rulesets today),
+      # but not after a cancel or without a token.
+      - name: Settings
+        if: ${{ !cancelled() && steps.app-token.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ONLY: ${{ inputs.only }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          args=(--shard "$SHARD/8")
+          read -ra names <<< "$ONLY"
+          if [ "${#names[@]}" -gt 0 ]; then
+            args+=(--only "${names[@]}")
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          uv run wsbench --log work/events.jsonl settings "${args[@]}"
+      # Saved even when sync exits 1 (some repo failed), so the next run starts warm.
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: work/mirrors
+          key: mirrors-${{ matrix.shard }}-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sync-events-${{ matrix.shard }}
+          path: |
+            work/events.jsonl
+            work/changed
+          if-no-files-found: ignore
+
+  # One index rebuild per run, not one per shard: the dispatch is a write that the index
+  # repo's GITHUB_TOKEN-limited build pays for, so it happens once, if any shard changed.
+  notify:
+    needs: sync
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        # No artifact at all (every shard failed early) is not an error here.
+        continue-on-error: true
+        with:
+          pattern: sync-events-*
+          path: shards
+      - id: changed
+        name: Did any shard change something?
+        run: |
+          if [ -d shards ] && find shards -name changed -type f | grep -q .; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+      - id: app-token
+        if: steps.changed.outputs.any == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.BENCH_APP_ID }}
+          private-key: ${{ secrets.BENCH_APP_PRIVATE_KEY }}
+          owner: wafer-space-bench
+      - name: Dispatch bench-updated to the index repo
+        if: steps.changed.outputs.any == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh api -X POST repos/wafer-space-bench/wafer-space-bench.github.io/dispatches -f event_type=bench-updated

@@ -1,0 +1,45 @@
+name: Pages
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [bench-updated]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: wafer-space/wafer.space-bench
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - run: uv sync --locked
+      - run: uv run wsbench index --out _site_src
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/jekyll-build-pages@v1
+        with:
+          source: _site_src
+      - uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

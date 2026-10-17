@@ -1,0 +1,33 @@
+[project]
+name = "wafer-space-bench"
+version = "0.1.0"
+description = "Manage GitHub copies of chip-design benchmark repositories"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "jinja2",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+wsbench = "wafer_space_bench.cli:main"
+
+[dependency-groups]
+dev = ["pytest", "pytest-socket", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wafer_space_bench"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "--disable-socket --allow-unix-socket"
+
+[tool.ruff]
+line-length = 110
+extend-exclude = ["docs"]

@@ -1,0 +1,11 @@
+# Copy to bench.local.toml (git-ignored) and adjust for this machine.
+
+# Where wsbench keeps local bare clones (work_dir/mirrors/<bench name>.git) and output.
+work_dir = "work"
+
+# Public URL prefix -> local directory of bare mirrors with the same layout.
+# A clone uses the local mirror when <dir>/<rest of URL>[.git] exists, else the public URL.
+# Deleted repos can only be restored through a mirror.
+[mirrors]
+"https://github.com/" = "/path/to/mirrors/github.com/"
+"https://foss-eda-tools.googlesource.com/" = "/path/to/mirrors/foss-eda-tools.googlesource.com/"

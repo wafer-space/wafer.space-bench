@@ -1,0 +1,10 @@
+bench.local.toml
+*.jsonl
+.venv/
+__pycache__/
+work/
+.superpowers/
+out/
+_site_src/
+.pytest_cache/
+.ruff_cache/
