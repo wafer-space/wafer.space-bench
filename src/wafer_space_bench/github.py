@@ -1,0 +1,175 @@
+"""The GitHub boundary: a Protocol, a `gh api` implementation, and its error types.
+
+Every GitHub call the tooling makes goes through `GitHub`. Tests use the in-memory
+`FakeGitHub` in tests/fakes.py, which implements the same Protocol.
+"""
+
+import base64
+import json
+import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
+from urllib.parse import quote
+
+
+class GitHubError(Exception):
+    """A GitHub API call failed. The message holds only the command and gh's stderr."""
+
+
+class NotFound(GitHubError):
+    """HTTP 404: the repo, ref, commit or file does not exist (or is not visible)."""
+
+
+class RateLimited(GitHubError):
+    """GitHub's (secondary) rate limit refused the call; back off and retry."""
+
+
+@dataclass(frozen=True)
+class RepoInfo:
+    full_name: str  # current name; GitHub follows renames
+    fork: bool
+    network: str  # full name of the network root (the fork source), else full_name
+    default_branch: str
+    archived: bool
+    size_kb: int
+
+
+@runtime_checkable
+class GitHub(Protocol):
+    def get_repo(self, full_name: str) -> RepoInfo: ...
+    def resolve_commit(self, full_name: str, sha: str) -> str | None: ...
+    def fork(self, source_full_name: str, org: str, name: str) -> None: ...
+    def branches_visible(self, full_name: str) -> bool: ...
+    def get_tag(self, full_name: str, tag: str) -> str | None: ...
+    def create_tag(self, full_name: str, tag: str, sha: str, message: str) -> None: ...
+    def create_repo(self, org: str, name: str, description: str) -> None: ...
+    def set_default_branch(self, full_name: str, branch: str) -> None: ...
+    def list_repos(self, org: str) -> list[RepoInfo]: ...
+    def list_branches(self, full_name: str) -> dict[str, str]: ...
+    def set_ref(self, full_name: str, ref: str, sha: str) -> None: ...
+    def delete_ref(self, full_name: str, ref: str) -> None: ...
+    def get_file(self, full_name: str, path: str, ref: str) -> str | None: ...
+    def dispatch(self, full_name: str, event_type: str) -> None: ...
+
+
+def _classify(cmd: list[str], stderr: str) -> GitHubError:
+    msg = f"{' '.join(cmd[:5])}: {stderr}"
+    low = stderr.lower()
+    if "too quickly" in low or "secondary rate limit" in low:
+        return RateLimited(msg)
+    if "HTTP 404" in stderr:
+        return NotFound(msg)
+    return GitHubError(msg)
+
+
+def _repo_info(r: dict[str, Any]) -> RepoInfo:
+    return RepoInfo(
+        full_name=r["full_name"],
+        fork=bool(r.get("fork", False)),
+        network=(r.get("source") or {}).get("full_name", r["full_name"]),
+        default_branch=r.get("default_branch", ""),
+        archived=bool(r.get("archived", False)),
+        size_kb=int(r.get("size", 0)),
+    )
+
+
+class GhCli:
+    """`GitHub` implemented with the `gh api` command; `runner` is swappable for tests."""
+
+    def __init__(self, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run):
+        self._run = runner
+
+    def _api(
+        self,
+        endpoint: str,
+        method: str = "GET",
+        fields: dict[str, str | bool] | None = None,
+        paginate: bool = False,
+    ) -> Any:
+        cmd = ["gh", "api", "-X", method, endpoint]
+        for k, v in (fields or {}).items():
+            if isinstance(v, bool):
+                cmd += ["-F", f"{k}={str(v).lower()}"]
+            else:
+                cmd += ["-f", f"{k}={v}"]
+        if paginate:
+            cmd += ["--paginate", "--slurp"]
+        p = self._run(cmd, capture_output=True, text=True)
+        if p.returncode != 0:
+            raise _classify(cmd, (p.stderr or "").strip())
+        return json.loads(p.stdout) if p.stdout.strip() else {}
+
+    def get_repo(self, full_name: str) -> RepoInfo:
+        return _repo_info(self._api(f"repos/{full_name}"))
+
+    def resolve_commit(self, full_name: str, sha: str) -> str | None:
+        try:
+            return self._api(f"repos/{full_name}/commits/{sha}")["sha"]
+        except NotFound:
+            return None
+        except GitHubError as e:
+            if "HTTP 422" in str(e):
+                return None
+            raise
+
+    def fork(self, source_full_name: str, org: str, name: str) -> None:
+        self._api(
+            f"repos/{source_full_name}/forks",
+            "POST",
+            {"organization": org, "name": name, "default_branch_only": False},
+        )
+
+    def branches_visible(self, full_name: str) -> bool:
+        return bool(self._api(f"repos/{full_name}/branches?per_page=1"))
+
+    def get_tag(self, full_name: str, tag: str) -> str | None:
+        try:
+            return self._api(f"repos/{full_name}/git/ref/tags/{tag}")["object"]["sha"]
+        except NotFound:
+            return None
+
+    def create_tag(self, full_name: str, tag: str, sha: str, message: str) -> None:
+        obj = self._api(
+            f"repos/{full_name}/git/tags",
+            "POST",
+            {"tag": tag, "message": message, "object": sha, "type": "commit"},
+        )
+        self._api(f"repos/{full_name}/git/refs", "POST", {"ref": f"refs/tags/{tag}", "sha": obj["sha"]})
+
+    def create_repo(self, org: str, name: str, description: str) -> None:
+        self._api(f"orgs/{org}/repos", "POST", {"name": name, "description": description, "private": False})
+
+    def set_default_branch(self, full_name: str, branch: str) -> None:
+        self._api(f"repos/{full_name}", "PATCH", {"default_branch": branch})
+
+    def list_repos(self, org: str) -> list[RepoInfo]:
+        """Every repo in `org`. The list endpoint carries no `source`, so `network` is
+        each repo's own full_name here; call `get_repo` when the real network matters."""
+        pages = self._api(f"orgs/{org}/repos?per_page=100", paginate=True)
+        return [_repo_info(r) for page in pages for r in page]
+
+    def list_branches(self, full_name: str) -> dict[str, str]:
+        pages = self._api(f"repos/{full_name}/branches?per_page=100", paginate=True)
+        return {b["name"]: b["commit"]["sha"] for page in pages for b in page}
+
+    def set_ref(self, full_name: str, ref: str, sha: str) -> None:
+        try:
+            self._api(f"repos/{full_name}/git/refs/{ref}", "PATCH", {"sha": sha, "force": True})
+        except GitHubError as e:
+            if "Reference does not exist" not in str(e):
+                raise
+            self._api(f"repos/{full_name}/git/refs", "POST", {"ref": f"refs/{ref}", "sha": sha})
+
+    def delete_ref(self, full_name: str, ref: str) -> None:
+        self._api(f"repos/{full_name}/git/refs/{ref}", "DELETE")
+
+    def get_file(self, full_name: str, path: str, ref: str) -> str | None:
+        try:
+            r = self._api(f"repos/{full_name}/contents/{path}?ref={quote(ref, safe='/')}")
+        except NotFound:
+            return None
+        return base64.b64decode(r["content"]).decode()
+
+    def dispatch(self, full_name: str, event_type: str) -> None:
+        self._api(f"repos/{full_name}/dispatches", "POST", {"event_type": event_type})
