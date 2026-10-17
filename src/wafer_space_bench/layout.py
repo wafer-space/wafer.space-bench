@@ -41,16 +41,23 @@ def is_tapeout_tag(tag: str) -> bool:
     return len(parts) == 3 and all(parts) and parts[0] in COMMIT_SOURCE
 
 
-def plan_layout(heads: list[str], tags: list[str]) -> LayoutPlan:
+def plan_layout(heads: list[str], tags: list[str], *, upstream_dev: bool = False) -> LayoutPlan:
     """The layout for a repo with these branch and tag names.
 
-    Conflicts: an existing `about` or `dev/*` branch, and any name `x` alongside `x/...`
-    among the existing and the new branch names (git cannot hold both). A clash is
-    reported by the existing heads in it, or else by the branches the new names come from."""
-    originals = sorted(h for h in heads if classify_branch(h) == "original")
+    `upstream_dev`: the repo has never been laid out, so a `dev/*` branch is upstream's own
+    (layout never creates one) and is copied to `upstream/dev/*` like any other. Once laid
+    out, `dev/*` is ours and never renamed or deleted.
+
+    Conflicts: an existing `about` (or, unless `upstream_dev`, `dev/*`) branch, and any name
+    `x` alongside `x/...` among the existing and the new branch names (git cannot hold
+    both). A clash is reported by the existing heads in it, or else by the branches the new
+    names come from."""
+    upstream_kinds = ("original", "dev") if upstream_dev else ("original",)
+    ours = ("about",) if upstream_dev else ("about", "dev")
+    originals = sorted(h for h in heads if classify_branch(h) in upstream_kinds)
     upstream = {b: f"upstream/{b}" for b in originals}
     tapeout = sorted(t for t in tags if is_tapeout_tag(t))
-    conflicts = {h for h in heads if classify_branch(h) in ("about", "dev")}
+    conflicts = {h for h in heads if classify_branch(h) in ours}
     source = {new: b for b, new in upstream.items()} | {f"tapeout/{t}": f"tapeout/{t}" for t in tapeout}
     names = set(heads) | set(source) | {"about"}
     for x in names:
@@ -143,7 +150,7 @@ def _layout(
     refs = Git.ls_remote(remote)
     heads = _heads(refs)
     tags = {r.removeprefix("refs/tags/"): s for r, s in refs.items() if r.startswith("refs/tags/")}
-    lp = plan_layout(list(heads), list(tags))
+    lp = plan_layout(list(heads), list(tags), upstream_dev=not laid_out)
 
     git = about_repo(cfg, target, remote, "about" in heads)
     if not laid_out:
