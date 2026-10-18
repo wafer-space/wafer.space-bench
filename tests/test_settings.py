@@ -153,6 +153,26 @@ def test_diff_settings_reports_only_differences():
     assert diff["has_wiki"] == (True, False)
 
 
+def test_ruleset_bypass_actors_compared_by_actor():
+    want = desired_settings(plan(), {})
+    rs = want.ruleset
+
+    def have(bypass):
+        return DesiredSettings(
+            repo=want.repo,
+            topics=want.topics,
+            actions_enabled=False,
+            vulnerability_alerts=False,
+            ruleset={n: r | {"bypass_actors": bypass} for n, r in rs.items()},
+        )
+
+    # A ruleset made before the App was the bypass actor is updated.
+    assert set(diff_settings(have([]), want)) == {f"ruleset:{n}" for n in rs}
+    # The same actor with its keys in GitHub's order is not a difference.
+    actor = rs["bench-frozen-tags"]["bypass_actors"][0]
+    assert diff_settings(have([dict(reversed(actor.items()))]), want) == {}
+
+
 def test_apply_settings_only_changes_diffs():
     gh, p = FakeGitHub(), plan()
     org_repo(gh, p)
@@ -332,9 +352,10 @@ def test_frozen_rulesets_shape():
         "enforcement": "active",
         "conditions": {"ref_name": {"include": ["refs/heads/tapeout/**"], "exclude": []}},
         "rules": RULES,
-        "bypass_actors": [],
+        "bypass_actors": [{"actor_id": 5354821, "actor_type": "Integration", "bypass_mode": "always"}],
     }
-    assert tags["target"] == "tag" and tags["rules"] == RULES and tags["bypass_actors"] == []
+    assert tags["target"] == "tag" and tags["rules"] == RULES
+    assert tags["bypass_actors"] == branches["bypass_actors"]
     assert tags["conditions"]["ref_name"]["include"] == [
         "refs/tags/wafer.space/**",
         "refs/tags/google/**",

@@ -144,7 +144,7 @@ as part of `sync.yml` so newly created repos are fixed automatically.
 | Topics | `wafer-space-bench`, `gf180mcu`, `open-silicon`, the strategy (`fork`, `copy` or `restore`), the tapeout org (`wafer-space`, `google` or `tinytapeout`) and each run (`ws-run1`, `gf180mcu-mpw0`, `ttgf0p2`, …) | Makes the org searchable and filterable |
 | Actions | disabled for the repo | Belt and braces with the org policy; mirrored upstream CI never runs |
 | Dependabot alerts and security updates | off | Mirrors of frozen tapeout code; avoids alert noise and bot PRs |
-| Rulesets `bench-frozen-branches` and `bench-frozen-tags` (a ruleset has one target) | block update, deletion and force-push of `refs/heads/tapeout/**` (branches) and of tags `refs/tags/wafer.space/**`, `refs/tags/google/**`, `refs/tags/tinytapeout/**` (tags); creation stays allowed | Enforces "frozen" on GitHub itself, with no bypass for anyone, including the App |
+| Rulesets `bench-frozen-branches` and `bench-frozen-tags` (a ruleset has one target) | block update, deletion and force-push of `refs/heads/tapeout/**` (branches) and of tags `refs/tags/wafer.space/**`, `refs/tags/google/**`, `refs/tags/tinytapeout/**` (tags); creation stays allowed | Enforces "frozen" on GitHub itself; the only bypass actor is the bench App, so the tooling can correct a wrong tapeout ref |
 | Forking | left allowed | Others may build on the bench repos |
 
 The index gives each row an anchor `id` equal to the repo name so the homepage link lands on it.
