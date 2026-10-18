@@ -227,6 +227,8 @@ def test_apply_layout_upstream_dev_branch_then_ours_kept(tmp_path, upstream, rem
     assert run(gh, tmp_path, remote, shas) == "ok: 4 upstream, 1 tapeout"
     heads = remote_heads(tmp_path)
     assert heads["upstream/dev/w"] == shas["main"] and "dev/w" not in heads
+    data = yaml.safe_load(Git(tmp_path / "remote.git").show("refs/heads/about", "bench.yaml"))
+    assert "upstream/dev/w" in data["branches"] and "dev/w" not in data["branches"]
 
     # Once laid out, dev/* is ours: a re-run keeps it.
     sh(tmp_path / "remote.git", "branch", "dev/mine", "upstream/main")
@@ -358,6 +360,25 @@ def test_apply_layout_resumes_after_crash_before_default(tmp_path, upstream, rem
         "about", "upstream/main", "upstream/feature/x", "upstream/ttgf0p2", f"tapeout/{TAG}"
     }  # fmt: skip
     assert gh.default_branch[TARGET] == "about"
+
+
+def test_apply_layout_resumes_upstream_dev_delete_after_crash(tmp_path, upstream, remote):
+    """The delete push fails (here: `main` moved) after the default switch. The re-run, now
+    laid out, still deletes the upstream `dev/w` original and leaves it out of `about`."""
+    path, shas = upstream
+    sh(path, "branch", "dev/w", shas["main"])
+    sh(path, "push", "-q", remote, "refs/heads/*:refs/heads/*")
+    gh = MoveAfterDefault(
+        tmp_path / "remote.git", lambda g: g.update_ref("refs/heads/main", shas["feature/x"])
+    )
+    gh.add_upstream(TARGET, branches=shas)
+    assert run(gh, tmp_path, remote, shas).startswith("error: ")
+    assert gh.default_branch[TARGET] == "about" and "dev/w" in remote_heads(tmp_path)  # laid out, not deleted
+    assert run(gh, tmp_path, remote, shas, now=LATER) == "ok: 4 upstream, 0 tapeout, 1 mismatch"
+    heads = remote_heads(tmp_path)
+    assert "dev/w" not in heads and heads["upstream/dev/w"] == shas["main"]
+    data = yaml.safe_load(Git(tmp_path / "remote.git").show("refs/heads/about", "bench.yaml"))
+    assert "dev/w" not in data["branches"]
 
 
 def test_apply_layout_retries_rate_limited(tmp_path, upstream, remote):
