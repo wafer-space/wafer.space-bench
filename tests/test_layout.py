@@ -144,6 +144,7 @@ def test_layout_conflicts():
     assert plan_layout(["x", "x/y"], []).conflicts == ["x", "x/y"]
     assert plan_layout(["about/x", "main"], []).conflicts == ["about/x"]  # the head, not "about"
     assert plan_layout(["dev/z", "main"], []).conflicts == ["dev/z"]
+    assert plan_layout(["dev/z", "main"], [], upstream_dev=True).conflicts == []
     # an original `upstream` (or `tapeout`) branch collides with the namespace it would need
     assert plan_layout(["upstream", "main"], []).conflicts == ["upstream"]
     assert plan_layout(["tapeout", "main"], [TAG]).conflicts == ["tapeout"]
@@ -177,6 +178,21 @@ def test_apply_layout_end_to_end(tmp_path, upstream, remote):
     assert data["generated"] == NOW
     assert "README.md" in sh(tmp_path / "remote.git", "ls-tree", "--name-only", "refs/heads/about").split()
     assert ("layout", {"target": TARGET, "status": status}) in ev
+
+
+def test_apply_layout_upstream_dev_branch_then_ours_kept(tmp_path, upstream, remote):
+    gh, shas = setup(tmp_path, upstream, remote, extra_heads=[("dev/w", "main")])
+    assert run(gh, tmp_path, remote, shas) == "ok: 4 upstream, 1 tapeout"
+    heads = remote_heads(tmp_path)
+    assert heads["upstream/dev/w"] == shas["main"] and "dev/w" not in heads
+    data = yaml.safe_load(Git(tmp_path / "remote.git").show("refs/heads/about", "bench.yaml"))
+    assert "upstream/dev/w" in data["branches"] and "dev/w" not in data["branches"]
+
+    # Once laid out, dev/* is ours: a re-run keeps it.
+    sh(tmp_path / "remote.git", "branch", "dev/mine", "upstream/main")
+    gh._sync(TARGET)
+    assert run(gh, tmp_path, remote, shas, now=LATER) == "ok: 4 upstream, 1 tapeout"
+    assert remote_heads(tmp_path)["dev/mine"] == shas["main"]
 
 
 def test_apply_layout_sets_default_before_delete(tmp_path, upstream, remote):
@@ -228,12 +244,11 @@ def test_apply_layout_conflict_stray_bench_names(tmp_path, upstream, remote):
             ("upstream/gone", "main"),
             ("upstream/feature/x", "main"),
             ("tapeout/x/y/z", "main"),
-            ("dev/w", "main"),
         ],
     )
     before = remote_heads(tmp_path)
     status = run(gh, tmp_path, remote, shas)
-    assert status == "conflict: dev/w, tapeout/x/y/z, upstream/feature/x, upstream/gone"
+    assert status == "conflict: tapeout/x/y/z, upstream/feature/x, upstream/gone"
     assert writes(gh) == []
     assert remote_heads(tmp_path) == before
 
@@ -272,6 +287,11 @@ class FailOnce(SyncedFake):
             raise exc
         super().set_ref(full_name, ref, sha)
 
+    def delete_ref(self, full_name, ref):
+        if exc := self._fail.pop("delete_ref", None):
+            raise exc
+        super().delete_ref(full_name, ref)
+
 
 def test_apply_layout_resumes_after_crash_before_default(tmp_path, upstream, remote):
     path, shas = upstream
@@ -288,6 +308,21 @@ def test_apply_layout_resumes_after_crash_before_default(tmp_path, upstream, rem
         "about", "upstream/main", "upstream/feature/x", "upstream/ttgf0p2", f"tapeout/{TAG}"
     }  # fmt: skip
     assert gh.default_branch[TARGET] == "about"
+
+
+def test_apply_layout_resumes_upstream_dev_delete_after_crash(tmp_path, upstream, remote):
+    path, shas = upstream
+    sh(path, "branch", "dev/w", shas["main"])
+    sh(path, "push", "-q", remote, "refs/heads/*:refs/heads/*")
+    gh = FailOnce(tmp_path / "remote.git", "delete_ref", GitHubError("boom (HTTP 500)"))
+    gh.add_upstream(TARGET, branches=shas)
+    assert run(gh, tmp_path, remote, shas).startswith("error: ")
+    assert gh.default_branch[TARGET] == "about" and "dev/w" in remote_heads(tmp_path)  # laid out, not deleted
+    assert run(gh, tmp_path, remote, shas, now=LATER) == "ok: 4 upstream, 0 tapeout"
+    heads = remote_heads(tmp_path)
+    assert "dev/w" not in heads and heads["upstream/dev/w"] == shas["main"]
+    data = yaml.safe_load(Git(tmp_path / "remote.git").show("refs/heads/about", "bench.yaml"))
+    assert "dev/w" not in data["branches"]
 
 
 def test_apply_layout_retries_rate_limited(tmp_path, upstream, remote):
@@ -390,7 +425,7 @@ def test_cli_layout(tmp_path, upstream, remote, monkeypatch):
 
 
 def test_cli_layout_exit_code_on_conflict(tmp_path, upstream, remote, monkeypatch):
-    gh, _ = setup(tmp_path, upstream, remote, extra_heads=[("dev/w", "main")])
+    gh, _ = setup(tmp_path, upstream, remote, extra_heads=[("about", "main")])
     write_plans(tmp_path / "plans.csv", [plan()])
     cat = tmp_path / "designs.csv"
     cat.write_text("pool,shuttle,code,project,repo,commit,licence,kind,size\n")
