@@ -33,10 +33,14 @@
     "th > button.sort { background: none; border: 0; padding: 0; margin: 0; font: inherit;" +
     " color: inherit; text-align: inherit; cursor: pointer; }" +
     "th > button.sort:focus-visible { outline: 2px solid currentColor; }" +
-    // A no-break space keeps the arrow on the label's last line.
-    "th > button.sort::after { content: \"\\A0\\2195\"; opacity: 0.35; }" +
-    "th[aria-sort=ascending] > button.sort::after { content: \"\\A0\\25B2\"; opacity: 1; }" +
-    "th[aria-sort=descending] > button.sort::after { content: \"\\A0\\25BC\"; opacity: 1; }";
+    // A no-break space keeps the arrow on the label's last line. The `/ ""` alt text keeps
+    // screen readers from reading the arrow (aria-sort says it); older browsers ignore that
+    // declaration and use the one before it.
+    "th > button.sort::after { content: \"\\A0\\2195\"; content: \"\\A0\\2195\" / \"\"; opacity: 0.35; }" +
+    "th[aria-sort=ascending] > button.sort::after" +
+    " { content: \"\\A0\\25B2\"; content: \"\\A0\\25B2\" / \"\"; opacity: 1; }" +
+    "th[aria-sort=descending] > button.sort::after" +
+    " { content: \"\\A0\\25BC\"; content: \"\\A0\\25BC\" / \"\"; opacity: 1; }";
   document.head.appendChild(style);
 
   function key(row, col) {
