@@ -684,15 +684,15 @@ def test_sync_workflow_shape():
         "owner": "wafer-space-bench",
     }
     key = "mirrors-${{ matrix.shard }}-${{ github.run_id }}"
-    restore = next(s for s in job["steps"] if s.get("uses") == "actions/cache/restore@v4")
+    restore = next(s for s in job["steps"] if s.get("uses") == "actions/cache/restore@v6")
     assert restore["with"] == {
         "path": "work/mirrors",
         "key": key,
         "restore-keys": "mirrors-${{ matrix.shard }}-",
     }
-    save = next(s for s in job["steps"] if s.get("uses") == "actions/cache/save@v4")
+    save = next(s for s in job["steps"] if s.get("uses") == "actions/cache/save@v6")
     assert save["if"] == "always()" and save["with"] == {"path": "work/mirrors", "key": key}
-    assert "actions/cache@v4" not in uses  # it would skip saving when sync exits 1
+    assert not any(u.startswith("actions/cache@") for u in uses)  # it would skip saving when sync exits 1
     upload = next(s for s in job["steps"] if s.get("uses") == "actions/upload-artifact@v7")
     assert upload["if"] == "always()" and "work/events.jsonl" in upload["with"]["path"].split()
     assert "${{ matrix.shard }}" in upload["with"]["name"]
