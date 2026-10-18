@@ -693,7 +693,7 @@ def test_sync_workflow_shape():
     save = next(s for s in job["steps"] if s.get("uses") == "actions/cache/save@v4")
     assert save["if"] == "always()" and save["with"] == {"path": "work/mirrors", "key": key}
     assert "actions/cache@v4" not in uses  # it would skip saving when sync exits 1
-    upload = next(s for s in job["steps"] if s.get("uses") == "actions/upload-artifact@v4")
+    upload = next(s for s in job["steps"] if s.get("uses") == "actions/upload-artifact@v7")
     assert upload["if"] == "always()" and "work/events.jsonl" in upload["with"]["path"].split()
     assert "${{ matrix.shard }}" in upload["with"]["name"]
     step = next(s for s in job["steps"] if "wsbench" in s.get("run", ""))

@@ -9,8 +9,10 @@ settings). Per repo, `apply_settings` reads the current state, compares it with
 - topics: the org, the process, the strategy, the tapeout orgs and runs;
 - Actions disabled, Dependabot alerts and security updates off;
 - rulesets `bench-frozen-branches` and `bench-frozen-tags`: no update, deletion or
-  force-push of `tapeout/**` branches and tapeout tags, for anyone (no bypass actors).
-  Creating them stays allowed, so `fork`, `copy`, `layout` and `sync` keep working.
+  force-push of `tapeout/**` branches and tapeout tags, for anyone but the bench App
+  (`wafer-space-bench-bot`, the only bypass actor, so the tooling can correct a wrong
+  tapeout ref). Creating them stays allowed, so `fork`, `copy`, `layout` and `sync` keep
+  working.
 """
 
 import re
@@ -34,6 +36,8 @@ BASE_TOPICS = ("wafer-space-bench", "gf180mcu", "open-silicon")
 FROZEN_RULES = ("deletion", "non_fast_forward", "update")
 FROZEN_TAG_PREFIXES = ("wafer.space", "google", "tinytapeout")
 PROGRESS_EVERY = 25
+BENCH_APP_ID = 5354821  # wafer-space-bench-bot; the workflows' `vars.BENCH_APP_ID`
+BYPASS_ACTORS = [{"actor_id": BENCH_APP_ID, "actor_type": "Integration", "bypass_mode": "always"}]
 
 
 @dataclass
@@ -59,7 +63,7 @@ def _ruleset(name: str, target: str, include: list[str]) -> dict:
         "enforcement": "active",
         "conditions": {"ref_name": {"include": include, "exclude": []}},
         "rules": [{"type": t} for t in FROZEN_RULES],
-        "bypass_actors": [],
+        "bypass_actors": BYPASS_ACTORS,
     }
 
 
@@ -146,7 +150,10 @@ def _ruleset_key(r: dict) -> tuple:
         sorted(ref.get("include") or []),
         sorted(ref.get("exclude") or []),
         sorted(x.get("type") for x in r.get("rules") or []),
-        r.get("bypass_actors") or [],
+        sorted(
+            (a.get("actor_type"), a.get("actor_id"), a.get("bypass_mode"))
+            for a in r.get("bypass_actors") or []
+        ),
     )
 
 
