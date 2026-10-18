@@ -5,6 +5,7 @@ fast instead of asking for credentials. Commits and tags are made as IDENTITY.
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -63,12 +64,31 @@ def _run(args: list[str], cwd: Path | None = None, stdin: str | None = None, che
     if check and p.returncode != 0:
         # Only the subcommand and its options; arguments (local paths, URLs) are redacted
         # from stderr too, since error text can end up in shared event logs.
-        shown = " ".join([args[0], *(a for a in args[1:] if a.startswith("-"))])
+        # A --force-with-lease option is shown once, without its ref:sha value.
+        opts = (a.split("=", 1)[0] if a.startswith("--force-with-lease=") else a for a in args[1:])
+        shown = " ".join([args[0], *dict.fromkeys(a for a in opts if a.startswith("-"))])
         err = (p.stderr or "").strip()
         for a in _redactions(args, cwd):
             err = err.replace(a, "<arg>")
         raise GitError(f"git {shown}: {err}"[:300])
     return p.stdout if p.returncode == 0 else ""
+
+
+def _create(dest: Path, make) -> Path:
+    """Run `make(tmp)` on the sibling `<dest>.tmp` (a leftover one is removed first) and
+    rename it to `dest` once it succeeds; on failure nothing is left at either path."""
+    if dest.exists():
+        raise GitError(f"git: destination already exists: {dest.name}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        make(tmp)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    tmp.rename(dest)
+    return dest
 
 
 class Git:
@@ -77,17 +97,23 @@ class Git:
 
     @classmethod
     def clone_bare(cls, url: str, dest: Path) -> "Git":
-        dest = Path(dest)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        _run(["clone", "--bare", "--quiet", url, str(dest)])
-        return cls(dest)
+        """A bare clone of `url` at `dest`. From a local path (a mirror) objects are copied,
+        never hardlinked, so nothing in `dest` shares an inode with the source. The clone is
+        made beside `dest` and renamed into place, so a failed clone leaves no `dest`."""
+        local = ["--no-hardlinks"] if "://" not in url and Path(url).exists() else []
+        return cls(
+            _create(Path(dest), lambda tmp: _run(["clone", "--bare", "--quiet", *local, url, str(tmp)]))
+        )
 
     @classmethod
     def init_bare(cls, path: Path) -> "Git":
+        """An empty bare repo at `path`, made beside it and renamed into place (an existing
+        repo is re-initialised in place, which keeps its refs and objects)."""
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _run(["init", "--bare", "--quiet", str(path)])
-        return cls(path)
+        if path.exists():
+            _run(["init", "--bare", "--quiet", str(path)])
+            return cls(path)
+        return cls(_create(path, lambda tmp: _run(["init", "--bare", "--quiet", str(tmp)])))
 
     def _git(self, *args: str, stdin: str | None = None) -> str:
         return _run(list(args), cwd=self.path, stdin=stdin)
@@ -178,3 +204,14 @@ class Git:
     def push(self, remote: str, refspecs: list[str], *, atomic: bool = False) -> None:
         """Push `refspecs`; `atomic` updates either every ref or none."""
         self._git("push", "--quiet", *(["--atomic"] if atomic else []), remote, *refspecs)
+
+    def push_leased(self, remote: str, updates: dict[str, tuple[str | None, str | None]]) -> None:
+        """One atomic push of `updates` {ref: (old, new)}: each ref is set to commit `new`
+        (None deletes it) only if the remote has it at `old` (None: absent), checked with
+        --force-with-lease. A ref already at `new` is left alone (a no-op). If any ref is not
+        at its `old`, no ref is updated and GitError is raised."""
+        if not updates:
+            return
+        leases = [f"--force-with-lease={ref}:{old or ''}" for ref, (old, _) in updates.items()]
+        specs = [f"{new or ''}:{ref}" for ref, (_, new) in updates.items()]
+        self._git("push", "--quiet", "--atomic", *leases, remote, *specs)

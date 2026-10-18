@@ -1,21 +1,24 @@
 """Tests for the branch layout (about, upstream/*, tapeout/*).
 
-FakeGitHub and the real git remote are kept consistent by `SyncedFake` (tests/fakes.py):
-its `set_ref`, `delete_ref` and `set_default_branch` also apply the change to the bare
-`file://` remote (git update-ref / symbolic-ref), and first copy the remote's heads and
-commits into the fake. `ls-remote` and the `about` push therefore see exactly what the API
-calls did, and the final-state assertions are made on the real remote.
+The layout writes branches with git pushes to a bare `file://` remote and switches the
+default branch through the API. `SyncedFake` (tests/fakes.py) copies the remote's heads and
+commits into the fake before each API write, so `set_default_branch` sees the pushed
+`about`; a test that compares the fake with the remote calls `gh._sync` first. Final-state
+assertions are made on the real remote. `record_pushes` logs the remote's pushes and the
+default-branch switch in one sequence, to pin their order.
 """
 
 import json
+import os
 
 import yaml
 from fakes import SyncedFake, sh
 
+from wafer_space_bench import git as git_module
 from wafer_space_bench.catalog import Tapeout
 from wafer_space_bench.cli import main
 from wafer_space_bench.config import LocalConfig
-from wafer_space_bench.copy import run_copy
+from wafer_space_bench.copy import local_clone_path, run_copy
 from wafer_space_bench.git import Git
 from wafer_space_bench.github import GitHubError, RateLimited
 from wafer_space_bench.layout import LayoutPlan, apply_layout, plan_layout, run_layouts
@@ -108,6 +111,44 @@ def writes(gh):
     return [c for c in gh.calls if c[0] in ("set_ref", "delete_ref", "set_default_branch")]
 
 
+ZERO = "0" * 40
+
+
+class OrderedFake(SyncedFake):
+    """SyncedFake that appends `set_default_branch` to the push log `record_pushes` keeps."""
+
+    def __init__(self, remote_path, log_path):
+        super().__init__(remote_path)
+        self.log_path = log_path
+
+    def set_default_branch(self, full_name, branch):
+        super().set_default_branch(full_name, branch)
+        with open(self.log_path, "a") as f:
+            f.write("set_default_branch\n")
+
+
+def record_pushes(tmp_path):
+    """A post-receive hook on the remote appending `push` and one `<old> <new> <ref>` line per
+    updated ref for every push (up-to-date refs are not listed). Returns the log path."""
+    log = tmp_path / "order.log"
+    hook = tmp_path / "remote.git" / "hooks" / "post-receive"
+    hook.write_text(f'#!/bin/sh\n{{ echo push; cat; }} >> "{log}"\n')
+    hook.chmod(0o755)
+    return log
+
+
+def pushes(log):
+    """The log as [("push", {ref: "create" | "update" | "delete"}) | ("set_default_branch",)]."""
+    out = []
+    for line in log.read_text().splitlines() if log.exists() else []:
+        if line in ("push", "set_default_branch"):
+            out.append((line, {}) if line == "push" else (line,))
+        else:
+            old, new, ref = line.split()
+            out[-1][1][ref] = "create" if old == ZERO else "delete" if new == ZERO else "update"
+    return out
+
+
 # --- plan_layout -------------------------------------------------------------
 
 
@@ -171,7 +212,8 @@ def test_apply_layout_end_to_end(tmp_path, upstream, remote):
         assert heads[f"upstream/{b}"] == shas[b]
     assert heads[f"tapeout/{TAG}"] == shas["ttgf0p2"]
     assert gh.default_branch[TARGET] == "about"
-    assert gh.branches[TARGET] == heads  # the fake and the real remote agree
+    gh._sync(TARGET)  # the pushes went to the remote only
+    assert gh.branches[TARGET] == heads
     about = Git(tmp_path / "remote.git")
     data = yaml.safe_load(about.show("refs/heads/about", "bench.yaml"))
     assert data["branches"] == sorted(heads)
@@ -196,14 +238,25 @@ def test_apply_layout_upstream_dev_branch_then_ours_kept(tmp_path, upstream, rem
 
 
 def test_apply_layout_sets_default_before_delete(tmp_path, upstream, remote):
-    gh, shas = setup(tmp_path, upstream, remote)
-    run(gh, tmp_path, remote, shas)
-    names = [c[0] for c in writes(gh)]
-    default = names.index("set_default_branch")
-    deletes = [i for i, n in enumerate(names) if n == "delete_ref"]
-    sets = [i for i, n in enumerate(names) if n == "set_ref"]
-    assert len(deletes) == 3 and len(sets) == 4
-    assert max(sets) < default < min(deletes)
+    """about push, one push creating every branch, the default switch, one push deleting the
+    originals; no ref is written through the refs API."""
+    path, shas = upstream
+    sh(path, "tag", "-a", TAG, "-m", "taped out", shas["ttgf0p2"])
+    sh(path, "push", "-q", remote, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
+    log = record_pushes(tmp_path)
+    gh = OrderedFake(tmp_path / "remote.git", log)
+    gh.add_upstream(TARGET, branches=shas)
+    assert run(gh, tmp_path, remote, shas) == "ok: 3 upstream, 1 tapeout"
+    assert pushes(log) == [
+        ("push", {"refs/heads/about": "create"}),
+        (
+            "push",
+            {f"refs/heads/upstream/{b}": "create" for b in shas} | {f"refs/heads/tapeout/{TAG}": "create"},
+        ),
+        ("set_default_branch",),
+        ("push", {f"refs/heads/{b}": "delete" for b in shas}),
+    ]
+    assert [c[0] for c in writes(gh)] == ["set_default_branch"]
 
 
 def test_apply_layout_idempotent(tmp_path, upstream, remote):
@@ -211,9 +264,11 @@ def test_apply_layout_idempotent(tmp_path, upstream, remote):
     first = run(gh, tmp_path, remote, shas)
     before = remote_heads(tmp_path)
     n = len(gh.calls)
+    log = record_pushes(tmp_path)
     second = run(gh, tmp_path, remote, shas, now=LATER)
     assert second == first
     assert writes(gh)[n:] == []  # no writes (the fake records only writes; reads are not checked)
+    assert pushes(log) == []
     assert remote_heads(tmp_path) == before  # no new about commit for a timestamp-only change
 
 
@@ -233,6 +288,7 @@ def test_apply_layout_conflict_upstream_about(tmp_path, upstream, remote):
     assert status == "conflict: about"
     assert writes(gh) == []
     assert remote_heads(tmp_path) == before
+    assert not local_clone_path(cfg(tmp_path), TARGET).exists()  # nothing cloned
 
 
 def test_apply_layout_conflict_stray_bench_names(tmp_path, upstream, remote):
@@ -264,12 +320,18 @@ def test_apply_layout_resumes_partial_run(tmp_path, upstream, remote):
     gh, shas = setup(
         tmp_path, upstream, remote, extra_heads=[("upstream/main", "main"), (f"tapeout/{TAG}", "ttgf0p2")]
     )
+    log = record_pushes(tmp_path)
     status = run(gh, tmp_path, remote, shas)
     assert status == "ok: 3 upstream, 1 tapeout"
     assert set(remote_heads(tmp_path)) == {
         "about", "upstream/main", "upstream/feature/x", "upstream/ttgf0p2", f"tapeout/{TAG}"
     }  # fmt: skip
-    assert ("set_ref", (TARGET, "heads/upstream/main", shas["main"])) not in gh.calls  # already right
+    created = [r for p in pushes(log) if p[0] == "push" for r, op in p[1].items() if op == "create"]
+    assert sorted(created) == [
+        "refs/heads/about",
+        "refs/heads/upstream/feature/x",
+        "refs/heads/upstream/ttgf0p2",
+    ]
 
 
 class FailOnce(SyncedFake):
@@ -281,16 +343,6 @@ class FailOnce(SyncedFake):
         if exc := self._fail.pop("set_default_branch", None):
             raise exc
         super().set_default_branch(full_name, branch)
-
-    def set_ref(self, full_name, ref, sha):
-        if exc := self._fail.pop("set_ref", None):
-            raise exc
-        super().set_ref(full_name, ref, sha)
-
-    def delete_ref(self, full_name, ref):
-        if exc := self._fail.pop("delete_ref", None):
-            raise exc
-        super().delete_ref(full_name, ref)
 
 
 def test_apply_layout_resumes_after_crash_before_default(tmp_path, upstream, remote):
@@ -311,14 +363,18 @@ def test_apply_layout_resumes_after_crash_before_default(tmp_path, upstream, rem
 
 
 def test_apply_layout_resumes_upstream_dev_delete_after_crash(tmp_path, upstream, remote):
+    """The delete push fails (here: `main` moved) after the default switch. The re-run, now
+    laid out, still deletes the upstream `dev/w` original and leaves it out of `about`."""
     path, shas = upstream
     sh(path, "branch", "dev/w", shas["main"])
     sh(path, "push", "-q", remote, "refs/heads/*:refs/heads/*")
-    gh = FailOnce(tmp_path / "remote.git", "delete_ref", GitHubError("boom (HTTP 500)"))
+    gh = MoveAfterDefault(
+        tmp_path / "remote.git", lambda g: g.update_ref("refs/heads/main", shas["feature/x"])
+    )
     gh.add_upstream(TARGET, branches=shas)
     assert run(gh, tmp_path, remote, shas).startswith("error: ")
     assert gh.default_branch[TARGET] == "about" and "dev/w" in remote_heads(tmp_path)  # laid out, not deleted
-    assert run(gh, tmp_path, remote, shas, now=LATER) == "ok: 4 upstream, 0 tapeout"
+    assert run(gh, tmp_path, remote, shas, now=LATER) == "ok: 4 upstream, 0 tapeout, 1 mismatch"
     heads = remote_heads(tmp_path)
     assert "dev/w" not in heads and heads["upstream/dev/w"] == shas["main"]
     data = yaml.safe_load(Git(tmp_path / "remote.git").show("refs/heads/about", "bench.yaml"))
@@ -328,7 +384,7 @@ def test_apply_layout_resumes_upstream_dev_delete_after_crash(tmp_path, upstream
 def test_apply_layout_retries_rate_limited(tmp_path, upstream, remote):
     path, shas = upstream
     sh(path, "push", "-q", remote, "refs/heads/*:refs/heads/*")
-    gh = FailOnce(tmp_path / "remote.git", "set_ref", RateLimited("too quickly"))
+    gh = FailOnce(tmp_path / "remote.git", "set_default_branch", RateLimited("too quickly"))
     gh.add_upstream(TARGET, branches=shas)
     ev, sleeps = Events(), Sleeps()
     assert run(gh, tmp_path, remote, shas, ev=ev, sleep=sleeps) == "ok: 3 upstream, 0 tapeout"
@@ -379,6 +435,7 @@ def test_apply_layout_dry_run(tmp_path, upstream, remote):
     assert writes(gh) == []
     assert remote_heads(tmp_path) == before
     assert ev[-1][0] == "layout" and ev[-1][1]["status"] == "dry-run: 3 upstream, 1 tapeout"
+    assert not local_clone_path(cfg(tmp_path), TARGET).exists()  # no clone, no fetch
 
 
 def test_apply_layout_git_error_is_returned(tmp_path, upstream, remote):
@@ -461,56 +518,117 @@ def test_apply_layout_empty_repo_is_not_laid_out(tmp_path, upstream, remote):
 
 
 class MoveAfterDefault(SyncedFake):
-    """Moves `main` on the remote right after the default branch switch (a concurrent push)."""
+    """Runs `act(remote Git)` right after the default branch switch (a concurrent push)."""
 
-    def __init__(self, remote_path, sha):
+    def __init__(self, remote_path, act):
         super().__init__(remote_path)
-        self._sha = sha
+        self._act = act
 
     def set_default_branch(self, full_name, branch):
         super().set_default_branch(full_name, branch)
-        self.remote.update_ref("refs/heads/main", self._sha)
+        self._act(self.remote)
 
 
-def test_apply_layout_skips_delete_of_branch_moved_since_listing(tmp_path, upstream, remote):
+def test_apply_layout_lease_keeps_branch_moved_since_listing(tmp_path, upstream, remote):
+    """`main` moves between the listing and the delete: the lease fails the atomic delete
+    push, so no original is deleted and the run reports an error. A re-run (now laid out)
+    deletes the others and leaves `main`, whose new commit is not under upstream/main."""
     path, shas = upstream
     sh(path, "push", "-q", remote, "refs/heads/*:refs/heads/*")
-    gh = MoveAfterDefault(tmp_path / "remote.git", shas["feature/x"])
+    gh = MoveAfterDefault(
+        tmp_path / "remote.git", lambda g: g.update_ref("refs/heads/main", shas["feature/x"])
+    )
     gh.add_upstream(TARGET, branches=shas)
-    ev = Events()
-    assert run(gh, tmp_path, remote, shas, ev=ev) == "ok: 3 upstream, 0 tapeout"
+    status = run(gh, tmp_path, remote, shas)
+    assert status.startswith("error: git push") and "stale info" in status
+    assert str(tmp_path) not in status
     heads = remote_heads(tmp_path)
-    assert heads["main"] == shas["feature/x"]  # kept: its new commit is not under upstream/main
-    assert heads["upstream/main"] == shas["main"]
-    assert "feature/x" not in heads and "ttgf0p2" not in heads
-    assert ("delete-skipped", {"target": TARGET, "branch": "main"}) in ev
+    assert heads["main"] == shas["feature/x"]
+    assert heads["feature/x"] == shas["feature/x"] and heads["ttgf0p2"] == shas["ttgf0p2"]  # atomic
+    assert heads["upstream/main"] == shas["main"] and gh.default_branch[TARGET] == "about"
 
-
-class LosesSetRef(SyncedFake):
-    """Accepts set_ref for `ref` but the branch never appears on the remote."""
-
-    def __init__(self, remote_path, ref):
-        super().__init__(remote_path)
-        self._lost = ref
-
-    def set_ref(self, full_name, ref, sha):
-        if ref == self._lost:
-            self._record("set_ref", full_name, ref, sha)
-            return
-        super().set_ref(full_name, ref, sha)
+    ev = Events()
+    assert run(gh, tmp_path, remote, shas, ev=ev) == "ok: 3 upstream, 0 tapeout, 1 mismatch"
+    heads = remote_heads(tmp_path)
+    assert heads["main"] == shas["feature/x"] and "feature/x" not in heads and "ttgf0p2" not in heads
+    assert ("upstream-mismatch", {"target": TARGET, "branch": "main", "branch_sha": shas["feature/x"],
+                                  "upstream_sha": shas["main"]}) in ev  # fmt: skip
 
 
 def test_apply_layout_deletes_only_verified_copies(tmp_path, upstream, remote):
+    """An `upstream/` copy that is gone by the delete push fails it: no original is deleted."""
     path, shas = upstream
     sh(path, "push", "-q", remote, "refs/heads/*:refs/heads/*")
-    gh = LosesSetRef(tmp_path / "remote.git", "heads/upstream/feature/x")
+    gh = MoveAfterDefault(tmp_path / "remote.git", lambda g: g.delete_ref("refs/heads/upstream/feature/x"))
     gh.add_upstream(TARGET, branches=shas)
-    ev = Events()
-    run(gh, tmp_path, remote, shas, ev=ev)
+    assert run(gh, tmp_path, remote, shas).startswith("error: ")
     heads = remote_heads(tmp_path)
-    assert heads["feature/x"] == shas["feature/x"]  # its copy is missing: not deleted
-    assert "main" not in heads and "ttgf0p2" not in heads
-    assert ("delete-skipped", {"target": TARGET, "branch": "feature/x"}) in ev
+    assert all(heads[b] == sha for b, sha in shas.items())
+
+
+def mirror_snapshot(root):
+    """Every ref, and every file's and directory's (mtime, size, link count), under bare repo `root`."""
+    entries = {}
+    for d, dirs, names in os.walk(root):
+        for n in [*dirs, *names]:
+            st = os.stat(os.path.join(d, n))
+            entries[os.path.relpath(os.path.join(d, n), root)] = (st.st_mtime_ns, st.st_size, st.st_nlink)
+    st = os.stat(root)
+    entries["."] = (st.st_mtime_ns, st.st_size, st.st_nlink)
+    return sh(root, "for-each-ref", "--format=%(refname) %(objectname)"), entries
+
+
+def test_apply_layout_without_mirror_fetches_bench_repo_only(tmp_path, upstream, remote, monkeypatch):
+    """No local mirror: no clone of the public upstream; an empty repo fetches the bench repo."""
+    gh, shas = setup(tmp_path, upstream, remote)
+    calls = []
+    real_run = git_module._run
+
+    def spy(args, cwd=None, **kw):
+        calls.append(args)
+        return real_run(args, cwd=cwd, **kw)
+
+    monkeypatch.setattr(git_module, "_run", spy)
+    ev = Events()
+    assert run(gh, tmp_path, remote, shas, ev=ev) == "ok: 3 upstream, 1 tapeout"
+    assert not [a for a in calls if a[0] == "clone"]
+    assert not [e for e, _ in ev if e == "seed-failed"]
+    assert not any("https://" in a for args in calls for a in args)
+    clone = local_clone_path(cfg(tmp_path), TARGET)
+    assert sh(clone, "rev-parse", "refs/bench/heads/main") == shas["main"]
+
+
+def test_apply_layout_seeds_clone_from_local_mirror_read_only(tmp_path, upstream, remote, monkeypatch):
+    """With a local mirror of upstream, the clone is seeded from it (copied, not hardlinked)
+    and git never runs inside it: its refs and files are unchanged."""
+    gh, shas = setup(tmp_path, upstream, remote)
+    mirrors = tmp_path / "mirrors"
+    mirror = mirrors / "a" / "upstream.git"
+    sh(tmp_path, "clone", "-q", "--bare", str(upstream[0]), str(mirror))
+    before = mirror_snapshot(mirror)
+    cwds = []
+    real_run = git_module._run
+
+    def spy(args, cwd=None, **kw):
+        cwds.append((cwd, args))
+        return real_run(args, cwd=cwd, **kw)
+
+    monkeypatch.setattr(git_module, "_run", spy)
+    mcfg = LocalConfig(work_dir=tmp_path / "work", mirrors={"https://github.com/": mirrors})
+    ev = Events()
+    status = apply_layout(plan(), tapeouts(shas["ttgf0p2"]), gh, mcfg, ORG, remote_fmt=remote, now=NOW,
+                          log=ev, sleep=Sleeps())  # fmt: skip
+    assert status == "ok: 3 upstream, 1 tapeout"
+    assert not [e for e, _ in ev if e == "seed-failed"]
+    clone = local_clone_path(mcfg, TARGET)
+    assert sh(clone, "config", "remote.origin.url") == str(mirror)  # seeded from the mirror
+    assert sh(clone, "rev-parse", f"refs/bench/tags/{TAG}^{{commit}}") == shas["ttgf0p2"]
+    assert mirror_snapshot(mirror) == before
+    clones = [args for cwd, args in cwds if args[0] == "clone"]
+    assert clones == [["clone", "--bare", "--quiet", "--no-hardlinks", str(mirror), f"{clone}.tmp"]]
+    for cwd, args in cwds:
+        assert cwd is None or mirror not in (cwd, *cwd.parents), args
+        assert not any(a in ("-C", "--git-dir") or a.startswith("--git-dir=") for a in args), args
 
 
 def test_apply_layout_laid_out_skips_df_clash(tmp_path, upstream, remote):

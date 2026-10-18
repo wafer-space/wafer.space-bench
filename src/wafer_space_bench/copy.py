@@ -71,9 +71,10 @@ def copy_why(plan: RepoPlan) -> str:
     return f"shares the fork network of {plan.network}"
 
 
-def _public_url(plan: RepoPlan, sources: dict[str, RestoreSource]) -> str:
+def public_url(plan: RepoPlan, sources: dict[str, RestoreSource] | None = None) -> str:
+    """The public URL `plan`'s repo is cloned from (a restore's public source if known)."""
     if plan.strategy == "restore":
-        src = sources.get(plan.source.key)
+        src = (sources or {}).get(plan.source.key)
         return src.public_url if src else plan.source.url
     if plan.source.host != "github.com":
         return plan.source.url
@@ -137,7 +138,7 @@ def run_copy(
     if plan.strategy not in STRATEGIES:
         raise ValueError(f"run_copy handles copy/restore plans, not {plan.strategy!r}")
     sources = sources or {}
-    public = _public_url(plan, sources)
+    public = public_url(plan, sources)
     url = resolve_clone_url(public, cfg)
     kind = "public" if url == public else "local mirror"
     fields = {"source": plan.source.url, "target": plan.target, "from": kind}
