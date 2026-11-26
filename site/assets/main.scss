@@ -1,0 +1,57 @@
+---
+# This file replaces the minima theme's assets/main.scss. The front matter makes Jekyll
+# compile it; the theme's styles are imported first and overridden below.
+---
+
+@import "minima";
+
+// Use the whole window. Minima caps the content at 740px, which leaves wide empty bands
+// either side and is too narrow for the repository table.
+.wrapper {
+  max-width: none;
+}
+
+.page-content {
+  table {
+    width: 100%;
+  }
+
+  th,
+  td {
+    vertical-align: top;
+  }
+}
+
+// Never scroll the page sideways. The repository table's long cells (repo name, upstream
+// URL, runs) may break anywhere, so the table shrinks with the window; they still stay on
+// one line when there is room. The short columns only break between words.
+#repo-table {
+  th:nth-child(1),
+  td:nth-child(1),
+  th:nth-child(2),
+  td:nth-child(2),
+  th:nth-child(5),
+  td:nth-child(5) {
+    overflow-wrap: anywhere;
+  }
+}
+
+// On a narrow screen even the short columns do not all fit: there a table scrolls inside
+// its own box, and the page still does not.
+@media screen and (max-width: 800px) {
+  .page-content table {
+    display: block;
+    overflow-x: auto;
+  }
+}
+
+// Text paragraphs stay a readable width even though tables use the whole window.
+.page-content .wrapper > p,
+.page-content .wrapper > ul {
+  max-width: 60em;
+}
+
+#repo-filter {
+  width: 24em;
+  max-width: 100%;
+}

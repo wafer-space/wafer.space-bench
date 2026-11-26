@@ -173,6 +173,20 @@ def test_write_site_outputs(tmp_path):
     write_site(rows, SITE, out)  # idempotent
 
 
+def test_site_stylesheet_overrides_minima_layout(tmp_path):
+    """The site's own main.scss replaces minima's: full window width, no sideways page scroll."""
+    write_site([], SITE, tmp_path)
+    scss = (tmp_path / "assets" / "main.scss").read_text()
+    assert scss.startswith("---\n"), "Jekyll only compiles a Sass file that has front matter"
+    body = scss[4:].split("\n---\n", 1)[1]
+    # Whitespace-insensitive, so reformatting the stylesheet does not fail the test.
+    flat = "".join(body.split())
+    assert flat.index('@import"minima";') < flat.index(".wrapper{max-width:none;}")
+    assert "overflow-wrap:anywhere;" in flat  # long names and URLs shrink with the window
+    assert "overflow-x:auto;" in flat  # a narrow screen scrolls the table, not the page
+    assert "http" not in body  # no external stylesheets or fonts
+
+
 def test_write_site_creates_out_dir(tmp_path):
     write_site([], SITE, tmp_path / "x" / "y")
     assert (tmp_path / "x" / "y" / "_data" / "repos.json").read_text().strip() == "[]"
